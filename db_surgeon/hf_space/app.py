@@ -271,7 +271,7 @@ def run_training(num_episodes, model_name, learning_rate):
 
             # Step 3: Dataset
             from db_surgeon.training.dataset import create_training_dataset
-            from db_surgeon.training.reward_functions import reward_func
+            from db_surgeon.training.reward_functions import reward_func, format_reward_func
             from trl import GRPOConfig, GRPOTrainer
 
             n = int(num_episodes)
@@ -344,7 +344,7 @@ def run_training(num_episodes, model_name, learning_rate):
 
             trainer_kwargs = dict(
                 model=model, tokenizer=tokenizer,
-                reward_funcs=reward_func,
+                reward_funcs=[reward_func, format_reward_func],
                 train_dataset=dataset,
                 args=config,
                 callbacks=[ProgressCallback()],
