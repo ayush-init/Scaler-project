@@ -8,7 +8,7 @@ after episodes complete.
 from __future__ import annotations
 
 
-def reward_func(environments, **kwargs) -> list[float]:
+def reward_func(prompts, completions, **kwargs) -> list[float]:
     """
     Read accumulated reward from each environment instance.
     
@@ -17,16 +17,23 @@ def reward_func(environments, **kwargs) -> list[float]:
     multi-turn episode from the environment wrapper.
     
     Args:
-        environments: List of DBSurgeonToolEnv instances.
-        **kwargs: Additional data from GRPOTrainer (completions, etc.)
+        prompts: List of prompt strings/messages from trainer.
+        completions: List of completion strings from trainer.
+        **kwargs: Additional data from GRPOTrainer including
+                  'environments' (list of DBSurgeonToolEnv instances).
         
     Returns:
         List of float rewards, one per environment.
     """
-    rewards = []
-    for env in environments:
-        rewards.append(getattr(env, "reward", 0.0))
-    return rewards
+    environments = kwargs.get("environments", [])
+    if environments:
+        rewards = []
+        for env in environments:
+            rewards.append(getattr(env, "reward", 0.0))
+        return rewards
+    
+    # Fallback: if no environments, return zeros
+    return [0.0] * len(completions)
 
 
 def format_reward_func(completions, **kwargs) -> list[float]:
