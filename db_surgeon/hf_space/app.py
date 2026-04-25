@@ -307,7 +307,33 @@ def run_training(num_episodes, model_name, learning_rate):
 
             config = GRPOConfig(**config_kwargs)
 
-            # Step 5: Train
+            # Step 5: Train with live progress callback
+            from transformers import TrainerCallback
+
+            class ProgressCallback(TrainerCallback):
+                def on_log(self, args, state, control, logs=None, **cb_kwargs):
+                    if logs:
+                        step = state.global_step
+                        total = state.max_steps
+                        loss = logs.get("loss", "?")
+                        reward = logs.get("reward", "?")
+                        lr = logs.get("learning_rate", "?")
+                        msg = f"  Step {step}/{total} | loss={loss} | reward={reward} | lr={lr}"
+                        training_state["log"].append(msg)
+                        training_state["progress"] = step
+                        if isinstance(loss, (int, float)):
+                            training_state["losses"].append(loss)
+                        if isinstance(reward, (int, float)):
+                            training_state["rewards"].append(reward)
+
+                def on_step_end(self, args, state, control, **cb_kwargs):
+                    # Log every 25 steps even without metrics
+                    if state.global_step % 25 == 0 and state.global_step > 0:
+                        elapsed = time.time() - training_state["start_time"]
+                        training_state["log"].append(
+                            f"  [Heartbeat] Step {state.global_step}/{state.max_steps} | {elapsed/60:.1f}min elapsed"
+                        )
+
             training_state["log"].append("Starting GRPO training...")
 
             trainer_kwargs = dict(
@@ -315,6 +341,7 @@ def run_training(num_episodes, model_name, learning_rate):
                 reward_funcs=reward_func,
                 train_dataset=dataset,
                 args=config,
+                callbacks=[ProgressCallback()],
             )
 
             # environment_factory may not exist in all TRL versions
@@ -322,15 +349,22 @@ def run_training(num_episodes, model_name, learning_rate):
                 trainer = GRPOTrainer(**trainer_kwargs, environment_factory=DBSurgeonToolEnv)
             except TypeError:
                 training_state["log"].append("  (environment_factory not supported, using default)")
-                trainer = GRPOTrainer(**trainer_kwargs)
+                del trainer_kwargs["callbacks"]  # rebuild without it
+                trainer = GRPOTrainer(
+                    model=model, tokenizer=tokenizer,
+                    reward_funcs=reward_func,
+                    train_dataset=dataset,
+                    args=config,
+                )
+                trainer.add_callback(ProgressCallback())
 
             trainer.train()
 
-            # Extract metrics from log history
+            # Extract any remaining metrics from log history
             for entry in trainer.state.log_history:
-                if "loss" in entry:
+                if "loss" in entry and entry["loss"] not in training_state["losses"]:
                     training_state["losses"].append(entry["loss"])
-                if "reward" in entry:
+                if "reward" in entry and entry["reward"] not in training_state["rewards"]:
                     training_state["rewards"].append(entry["reward"])
 
             training_state["log"].append("Training complete!")
