@@ -387,11 +387,16 @@ def run_training(num_episodes, model_name, learning_rate):
 
             # Optional: Push to HF Hub
             try:
-                hf_user = os.environ.get("SPACE_AUTHOR_NAME", "")
-                if hf_user:
+                hf_token = os.environ.get("HF_TOKEN", "")
+                hf_user = os.environ.get("SPACE_AUTHOR_NAME", "ayush0211")
+                if hf_token and hf_user:
+                    from huggingface_hub import login
+                    login(token=hf_token)
                     repo_id = f"{hf_user}/db-surgeon-qwen3-0.6b-grpo"
                     model.push_to_hub_merged(repo_id, tokenizer, save_method="merged_16bit")
                     training_state["log"].append(f"Model pushed to Hub: {repo_id}")
+                else:
+                    training_state["log"].append("Hub push skipped: no HF_TOKEN secret set")
             except Exception as e:
                 training_state["log"].append(f"Hub push skipped: {e}")
 
