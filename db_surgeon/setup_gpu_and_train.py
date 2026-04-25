@@ -109,8 +109,8 @@ def wait_for_gradio():
 
     for i in range(30):  # Wait up to 5 minutes
         try:
-            r = httpx.get(f"{SPACE_URL}/info", timeout=10)
-            if r.status_code == 200:
+            r = httpx.get(f"{SPACE_URL}/", timeout=15, follow_redirects=True)
+            if r.status_code == 200 and ("gradio" in r.text.lower() or "DB-Surgeon" in r.text):
                 print(f"  Gradio API is ready!")
                 return True
         except Exception:

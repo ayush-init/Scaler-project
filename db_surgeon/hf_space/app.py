@@ -260,7 +260,7 @@ def run_training(num_episodes, model_name, learning_rate):
             import torch
             training_state["log"].append(
                 f"Model loaded! GPU: {torch.cuda.memory_allocated()/1024**3:.1f}GB / "
-                f"{torch.cuda.get_device_properties(0).total_mem/1024**3:.1f}GB"
+                f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.1f}GB"
             )
 
             # Step 3: Dataset
@@ -581,4 +581,4 @@ with gr.Blocks(
 
 # ─── Launch ───
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False, ssr_mode=False)
