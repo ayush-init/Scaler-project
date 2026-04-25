@@ -1,0 +1,43 @@
+name: db_surgeon
+version: "0.1.0"
+description: >
+  DB-Surgeon: An RL environment where an LLM agent diagnoses and fixes
+  broken database schemas. The agent must inspect schema errors, identify
+  root causes (FK violations, type mismatches, etc.), apply DDL fixes,
+  and restore business queries to working state.
+
+author: DB-Surgeon Team
+license: BSD-3-Clause
+
+environment:
+  server:
+    module: db_surgeon.server.app
+    class: app
+    port: 7860
+    dockerfile: server/Dockerfile
+  client:
+    module: db_surgeon.client
+    class: DBSurgeonEnv
+
+action:
+  module: db_surgeon.models
+  class: DBSurgeonAction
+
+observation:
+  module: db_surgeon.models
+  class: DBSurgeonObservation
+
+state:
+  module: db_surgeon.models
+  class: DBSurgeonState
+
+supports_concurrent_sessions: true
+max_concurrent_envs: 64
+
+tags:
+  - database
+  - debugging
+  - sql
+  - schema-repair
+  - tool-use
+  - multi-step
