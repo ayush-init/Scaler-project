@@ -275,6 +275,10 @@ def run_training(num_episodes, model_name, learning_rate):
             # Step 4: Configure — resilient to different TRL versions
             output_dir = "/tmp/db_surgeon_output"
             os.makedirs(output_dir, exist_ok=True)
+            # Auto-detect bf16 vs fp16 based on GPU capability
+            import torch
+            gpu_bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+            training_state["log"].append(f"  GPU bf16 support: {gpu_bf16}")
 
             config_kwargs = dict(
                 output_dir=output_dir,
@@ -290,8 +294,8 @@ def run_training(num_episodes, model_name, learning_rate):
                 log_completions=True,
                 save_steps=50,
                 save_total_limit=3,
-                bf16=False,
-                fp16=True,
+                bf16=gpu_bf16,
+                fp16=not gpu_bf16,
                 gradient_checkpointing=True,
             )
 
