@@ -258,8 +258,8 @@ class DBSurgeonToolEnv:
         """Update internal state from step result."""
         self._total_reward += result.reward
         self.done = result.done
-        if result.done:
-            self.reward = self._total_reward
+        # Always update self.reward so TRL can read it at any time
+        self.reward = self._total_reward
 
     def _format_observation(self, obs) -> str:
         """Format the observation into a readable string for the LLM."""
