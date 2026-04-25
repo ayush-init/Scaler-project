@@ -245,16 +245,16 @@ def run_training(num_episodes, model_name, learning_rate):
             from unsloth import FastLanguageModel
             import torch
 
-            # Match model dtype to GPU capability
-            gpu_bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
-            model_dtype = torch.bfloat16 if gpu_bf16 else torch.float16
-            training_state["log"].append(f"  Using dtype: {model_dtype} (bf16={gpu_bf16})")
+            # IMPORTANT: Always use float16 with 4-bit quantization.
+            # bitsandbytes dequantizes 4-bit weights to float16 internally.
+            # Using bf16 causes dtype mismatch in LoRA matmul kernels.
+            training_state["log"].append("  Using dtype: float16 (required for 4-bit quant)")
 
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=model_name,
                 max_seq_length=2048,
                 load_in_4bit=True,
-                dtype=model_dtype,
+                dtype=torch.float16,
             )
 
             model = FastLanguageModel.get_peft_model(
@@ -281,11 +281,7 @@ def run_training(num_episodes, model_name, learning_rate):
             # Step 4: Configure — resilient to different TRL versions
             output_dir = "/tmp/db_surgeon_output"
             os.makedirs(output_dir, exist_ok=True)
-            # Auto-detect bf16 vs fp16 based on GPU capability
-            import torch
-            gpu_bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
-            training_state["log"].append(f"  GPU bf16 support: {gpu_bf16}")
-
+            # Always fp16 with 4-bit quantization (bitsandbytes constraint)
             config_kwargs = dict(
                 output_dir=output_dir,
                 max_completion_length=2048,
@@ -300,8 +296,8 @@ def run_training(num_episodes, model_name, learning_rate):
                 log_completions=True,
                 save_steps=50,
                 save_total_limit=3,
-                bf16=gpu_bf16,
-                fp16=not gpu_bf16,
+                bf16=False,
+                fp16=True,
                 gradient_checkpointing=True,
             )
 
