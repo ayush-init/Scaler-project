@@ -243,12 +243,18 @@ def run_training(num_episodes, model_name, learning_rate):
             # Step 2: Load model
             training_state["log"].append(f"Loading {model_name} with Unsloth (4-bit)...")
             from unsloth import FastLanguageModel
+            import torch
+
+            # Match model dtype to GPU capability
+            gpu_bf16 = torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False
+            model_dtype = torch.bfloat16 if gpu_bf16 else torch.float16
+            training_state["log"].append(f"  Using dtype: {model_dtype} (bf16={gpu_bf16})")
 
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=model_name,
                 max_seq_length=2048,
                 load_in_4bit=True,
-                dtype=None,
+                dtype=model_dtype,
             )
 
             model = FastLanguageModel.get_peft_model(
