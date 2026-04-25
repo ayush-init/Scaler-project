@@ -272,15 +272,14 @@ def run_training(num_episodes, model_name, learning_rate):
             dataset = create_training_dataset(n)
             training_state["log"].append(f"Dataset: {len(dataset)} episodes")
 
-            # Step 4: Configure
+            # Step 4: Configure — resilient to different TRL versions
             output_dir = "/tmp/db_surgeon_output"
             os.makedirs(output_dir, exist_ok=True)
 
-            config = GRPOConfig(
+            config_kwargs = dict(
                 output_dir=output_dir,
                 max_completion_length=2048,
                 num_generations=4,
-                chat_template_kwargs={"enable_thinking": False},
                 learning_rate=float(learning_rate),
                 per_device_train_batch_size=1,
                 gradient_accumulation_steps=8,
@@ -296,15 +295,34 @@ def run_training(num_episodes, model_name, learning_rate):
                 gradient_checkpointing=True,
             )
 
+            # Try with optional kwargs, drop them if unsupported
+            optional_kwargs = {"chat_template_kwargs": {"enable_thinking": False}}
+            for key, val in optional_kwargs.items():
+                try:
+                    test = GRPOConfig(**{key: val, "output_dir": "/tmp/_test"})
+                    config_kwargs[key] = val
+                    del test
+                except TypeError:
+                    training_state["log"].append(f"  (Skipping unsupported config: {key})")
+
+            config = GRPOConfig(**config_kwargs)
+
             # Step 5: Train
             training_state["log"].append("Starting GRPO training...")
-            trainer = GRPOTrainer(
+
+            trainer_kwargs = dict(
                 model=model, tokenizer=tokenizer,
                 reward_funcs=reward_func,
                 train_dataset=dataset,
                 args=config,
-                environment_factory=DBSurgeonToolEnv,
             )
+
+            # environment_factory may not exist in all TRL versions
+            try:
+                trainer = GRPOTrainer(**trainer_kwargs, environment_factory=DBSurgeonToolEnv)
+            except TypeError:
+                training_state["log"].append("  (environment_factory not supported, using default)")
+                trainer = GRPOTrainer(**trainer_kwargs)
 
             trainer.train()
 
