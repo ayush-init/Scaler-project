@@ -466,6 +466,233 @@ def _format_autoplay_output(log_lines, state, obs):
     reward = f"{state.total_reward:+.1f}"
     return status, schema, error, query, history, reward
 
+
+# ═══════════════════════════════════════════════════════════════
+# NATURAL LANGUAGE TO SQL (NL2SQL)
+# ═══════════════════════════════════════════════════════════════
+
+# Dedicated database for NL2SQL queries
+_nl2sql_db = None
+_nl2sql_schema = ""
+
+def nl2sql_reset_db():
+    """Create a fresh sample database for NL2SQL queries."""
+    global _nl2sql_db, _nl2sql_schema
+    import sqlite3
+
+    _nl2sql_db = sqlite3.connect(":memory:")
+
+    schema_sql = """
+CREATE TABLE employees (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    department TEXT NOT NULL,
+    salary REAL NOT NULL,
+    hire_date TEXT NOT NULL,
+    city TEXT NOT NULL,
+    age INTEGER
+);
+
+CREATE TABLE departments (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    budget REAL NOT NULL,
+    manager TEXT
+);
+
+CREATE TABLE projects (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    department_id INTEGER,
+    status TEXT DEFAULT 'active',
+    start_date TEXT,
+    budget REAL,
+    FOREIGN KEY (department_id) REFERENCES departments(id)
+);
+
+CREATE TABLE sales (
+    id INTEGER PRIMARY KEY,
+    employee_id INTEGER,
+    product TEXT NOT NULL,
+    amount REAL NOT NULL,
+    sale_date TEXT NOT NULL,
+    region TEXT,
+    FOREIGN KEY (employee_id) REFERENCES employees(id)
+);
+"""
+
+    seed_sql = """
+INSERT INTO departments VALUES (1, 'Engineering', 500000, 'Rajesh Kumar');
+INSERT INTO departments VALUES (2, 'Marketing', 200000, 'Priya Sharma');
+INSERT INTO departments VALUES (3, 'Sales', 300000, 'Amit Patel');
+INSERT INTO departments VALUES (4, 'HR', 150000, 'Sunita Verma');
+INSERT INTO departments VALUES (5, 'Finance', 250000, 'Vikram Singh');
+
+INSERT INTO employees VALUES (1, 'Rahul Sharma', 'Engineering', 85000, '2021-03-15', 'Mumbai', 28);
+INSERT INTO employees VALUES (2, 'Priya Gupta', 'Marketing', 65000, '2022-06-01', 'Delhi', 26);
+INSERT INTO employees VALUES (3, 'Amit Singh', 'Engineering', 92000, '2020-01-10', 'Bangalore', 32);
+INSERT INTO employees VALUES (4, 'Neha Patel', 'Sales', 70000, '2021-09-20', 'Mumbai', 29);
+INSERT INTO employees VALUES (5, 'Vikram Joshi', 'Engineering', 110000, '2019-05-01', 'Pune', 35);
+INSERT INTO employees VALUES (6, 'Anita Desai', 'HR', 60000, '2023-01-15', 'Delhi', 24);
+INSERT INTO employees VALUES (7, 'Suresh Reddy', 'Sales', 75000, '2020-11-10', 'Hyderabad', 31);
+INSERT INTO employees VALUES (8, 'Kavita Nair', 'Marketing', 72000, '2021-07-22', 'Bangalore', 27);
+INSERT INTO employees VALUES (9, 'Ravi Iyer', 'Finance', 88000, '2020-04-05', 'Chennai', 33);
+INSERT INTO employees VALUES (10, 'Deepa Menon', 'Engineering', 95000, '2022-02-14', 'Pune', 30);
+INSERT INTO employees VALUES (11, 'Arjun Kumar', 'Sales', 68000, '2023-03-01', 'Mumbai', 25);
+INSERT INTO employees VALUES (12, 'Meera Krishnan', 'Finance', 82000, '2021-08-18', 'Chennai', 29);
+
+INSERT INTO projects VALUES (1, 'Cloud Migration', 1, 'active', '2024-01-01', 200000);
+INSERT INTO projects VALUES (2, 'Brand Redesign', 2, 'completed', '2023-06-01', 50000);
+INSERT INTO projects VALUES (3, 'Sales Portal', 3, 'active', '2024-03-15', 150000);
+INSERT INTO projects VALUES (4, 'HR Automation', 4, 'active', '2024-02-01', 80000);
+INSERT INTO projects VALUES (5, 'Data Pipeline', 1, 'active', '2024-04-01', 120000);
+
+INSERT INTO sales VALUES (1, 4, 'Widget Pro', 15000, '2024-01-15', 'North');
+INSERT INTO sales VALUES (2, 7, 'Gadget Plus', 22000, '2024-01-20', 'South');
+INSERT INTO sales VALUES (3, 11, 'Widget Pro', 18000, '2024-02-05', 'West');
+INSERT INTO sales VALUES (4, 4, 'Mega Suite', 45000, '2024-02-10', 'North');
+INSERT INTO sales VALUES (5, 7, 'Widget Pro', 12000, '2024-02-15', 'South');
+INSERT INTO sales VALUES (6, 11, 'Gadget Plus', 35000, '2024-03-01', 'East');
+INSERT INTO sales VALUES (7, 4, 'Gadget Plus', 28000, '2024-03-10', 'North');
+INSERT INTO sales VALUES (8, 7, 'Mega Suite', 52000, '2024-03-15', 'South');
+"""
+
+    for stmt in schema_sql.strip().split(";"):
+        stmt = stmt.strip()
+        if stmt:
+            _nl2sql_db.execute(stmt)
+
+    for stmt in seed_sql.strip().split(";"):
+        stmt = stmt.strip()
+        if stmt:
+            _nl2sql_db.execute(stmt)
+
+    _nl2sql_db.commit()
+
+    _nl2sql_schema = """Tables in database:
+
+1. employees (id, name, department, salary, hire_date, city, age)
+   - 12 employees across Engineering, Marketing, Sales, HR, Finance
+   - Cities: Mumbai, Delhi, Bangalore, Pune, Hyderabad, Chennai
+
+2. departments (id, name, budget, manager)
+   - Engineering, Marketing, Sales, HR, Finance
+
+3. projects (id, name, department_id, status, start_date, budget)
+   - Status: active, completed
+
+4. sales (id, employee_id, product, amount, sale_date, region)
+   - Products: Widget Pro, Gadget Plus, Mega Suite
+   - Regions: North, South, East, West"""
+
+    return _nl2sql_schema, "✅ Fresh database loaded! You can now ask questions in any language."
+
+
+def nl2sql_query(user_question):
+    """Convert natural language question to SQL and execute it."""
+    global _nl2sql_db, _nl2sql_schema
+    import torch
+
+    if _nl2sql_db is None:
+        return "⚠️ Please click **Load Database** first!", "", ""
+
+    if not user_question or not user_question.strip():
+        return "⚠️ Please type a question!", "", ""
+
+    # Step 1: Load model
+    try:
+        model, tokenizer = _load_trained_model()
+    except Exception as e:
+        return f"❌ Model load error: {e}", "", ""
+
+    # Step 2: Prompt the model to generate SQL
+    prompt = f"""You are a SQL expert. Convert the user's natural language question into a SQL query.
+
+DATABASE SCHEMA:
+{_nl2sql_schema}
+
+RULES:
+- Output ONLY the SQL query, nothing else
+- Use standard SQLite SQL syntax
+- Do NOT explain the query
+- Do NOT wrap in markdown code blocks
+- If the question is in Hindi or any other language, understand it and still output valid SQL
+
+USER QUESTION: {user_question}
+
+SQL QUERY:"""
+
+    messages = [{"role": "user", "content": prompt}]
+
+    try:
+        input_ids = tokenizer.apply_chat_template(
+            messages, return_tensors="pt", add_generation_prompt=True
+        )
+        if torch.cuda.is_available():
+            input_ids = input_ids.to("cuda")
+
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids,
+                max_new_tokens=256,
+                temperature=0.3,
+                top_p=0.9,
+                do_sample=True,
+            )
+
+        response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+
+        # Clean up: strip thinking blocks and extract SQL
+        sql = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+        sql = re.sub(r'<think>.*$', '', sql, flags=re.DOTALL)
+        sql = sql.strip()
+
+        # Remove markdown code fences if present
+        sql = re.sub(r'^```sql\s*', '', sql)
+        sql = re.sub(r'^```\s*', '', sql)
+        sql = re.sub(r'\s*```$', '', sql)
+        sql = sql.strip()
+
+        # Take only the first SQL statement
+        if ";" in sql:
+            sql = sql.split(";")[0] + ";"
+        
+        if not sql:
+            return "⚠️ Model didn't generate a SQL query. Try rephrasing.", "", ""
+
+    except Exception as e:
+        return f"❌ Generation error: {e}", "", ""
+
+    # Step 3: Execute the SQL
+    try:
+        cursor = _nl2sql_db.execute(sql)
+        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        rows = cursor.fetchall()
+
+        # Format results as a table
+        if not rows:
+            result_text = "(No results returned)"
+        else:
+            # Header
+            col_widths = [max(len(str(col)), max(len(str(row[i])) for row in rows)) for i, col in enumerate(columns)]
+            header = " | ".join(str(col).ljust(w) for col, w in zip(columns, col_widths))
+            separator = "-+-".join("-" * w for w in col_widths)
+            
+            result_lines = [header, separator]
+            for row in rows[:50]:  # Limit to 50 rows
+                result_lines.append(" | ".join(str(val).ljust(w) for val, w in zip(row, col_widths)))
+            
+            if len(rows) > 50:
+                result_lines.append(f"\n... and {len(rows) - 50} more rows")
+            
+            result_lines.append(f"\n({len(rows)} rows returned)")
+            result_text = "\n".join(result_lines)
+
+        return f"✅ Query executed successfully!", sql, result_text
+
+    except Exception as e:
+        return f"❌ SQL Error: {e}", sql, f"The generated SQL had an error:\n{e}\n\nTry rephrasing your question."
+
 # ═══════════════════════════════════════════════════════════════
 # TAB 2: TRAINING
 # ═══════════════════════════════════════════════════════════════
@@ -903,7 +1130,63 @@ with gr.Blocks(
                 outputs=[demo_status, demo_schema, demo_error, demo_query, demo_history, demo_reward],
             )
 
-        # ─── TAB 2: TRAINING ───
+        # ─── TAB 2: NATURAL LANGUAGE TO SQL ───
+        with gr.Tab("💬 Ask in Any Language"):
+            gr.Markdown("### Ask questions about a database in any language — Hindi, English, or anything!")
+            gr.Markdown("The trained model converts your natural language question into SQL, runs it, and shows results.")
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    nl2sql_schema_display = gr.Textbox(
+                        label="📊 Database Schema",
+                        lines=15, interactive=False,
+                        placeholder="Click 'Load Database' to see the schema..."
+                    )
+                with gr.Column(scale=1):
+                    gr.Markdown("**Example questions:**")
+                    gr.Markdown("""
+- Show all employees from Mumbai
+- सबसे ज्यादा सैलरी किसकी है?
+- Engineering department ka budget kitna hai?
+- List products with total sales above 30000
+- कौन से projects active हैं?
+- Which region has the most sales?
+- मुंबई में कितने employees हैं?
+""")
+
+            load_db_btn = gr.Button("🗄️ Load Database", variant="primary")
+            nl2sql_db_status = gr.Markdown("")
+
+            gr.Markdown("---")
+
+            with gr.Row():
+                nl2sql_input = gr.Textbox(
+                    label="🗣️ Your Question (any language)",
+                    placeholder="e.g., 'Show me all employees with salary above 80000' or 'सबसे ज्यादा सैलरी किसकी है?'",
+                    lines=2, scale=4,
+                )
+                nl2sql_btn = gr.Button("🔍 Ask", variant="primary", scale=1)
+
+            nl2sql_status = gr.Markdown("")
+            nl2sql_generated_sql = gr.Textbox(label="🤖 Generated SQL", lines=3, interactive=False)
+            nl2sql_results = gr.Textbox(label="📋 Query Results", lines=12, interactive=False, show_copy_button=True)
+
+            load_db_btn.click(
+                nl2sql_reset_db,
+                outputs=[nl2sql_schema_display, nl2sql_db_status],
+            )
+            nl2sql_btn.click(
+                nl2sql_query,
+                inputs=[nl2sql_input],
+                outputs=[nl2sql_status, nl2sql_generated_sql, nl2sql_results],
+            )
+            nl2sql_input.submit(
+                nl2sql_query,
+                inputs=[nl2sql_input],
+                outputs=[nl2sql_status, nl2sql_generated_sql, nl2sql_results],
+            )
+
+        # ─── TAB 3: TRAINING ───
         with gr.Tab("🚀 Training"):
             gr.Markdown("### Train an LLM to fix databases using GRPO + Unsloth")
             gr.Markdown("This runs GRPO training with your HuggingFace GPU. **$30 budget = ~30 hours of A10G.**")
