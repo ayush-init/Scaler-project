@@ -282,7 +282,8 @@ def auto_play_model():
 
     # Step 2: Load model
     log_lines.append("\n⏳ Loading trained model...")
-    yield _format_autoplay_output(log_lines, state, demo_obs)
+    model = None
+    tokenizer = None
 
     try:
         model, tokenizer = _load_trained_model()
@@ -290,9 +291,7 @@ def auto_play_model():
     except Exception as e:
         log_lines.append(f"❌ Model load failed: {e}")
         log_lines.append("\n🔧 Falling back to scripted agent...")
-        # Fallback: run scripted agent
-        yield from _run_fallback_scripted(log_lines, state)
-        return
+        return _run_fallback_scripted(log_lines)
 
     # Step 3: Generate & execute actions
     max_turns = 8
@@ -338,7 +337,7 @@ Diagnose the issue and fix it. Call the appropriate tool."""
                 )
 
             response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-            log_lines.append(f"🧠 Model output:\n{response[:300]}{'...' if len(response) > 300 else ''}")
+            log_lines.append(f"🧠 Model says:\n{response[:400]}{'...' if len(response) > 400 else ''}")
 
         except Exception as e:
             log_lines.append(f"❌ Generation error: {e}")
@@ -368,11 +367,8 @@ Diagnose the issue and fix it. Call the appropriate tool."""
             except Exception as e:
                 log_lines.append(f"  ❌ Action error: {e}")
 
-        yield _format_autoplay_output(log_lines, state, demo_obs)
-
     # Final status
     if not result.done:
-        # Force submit
         log_lines.append(f"\n{'─' * 40}")
         log_lines.append("⏰ Max turns reached, submitting...")
         result = demo_env.step(DBSurgeonAction("submit", {}))
@@ -380,16 +376,16 @@ Diagnose the issue and fix it. Call the appropriate tool."""
         state = demo_env.state()
 
     log_lines.append(f"\n{'=' * 60}")
-    log_lines.append(f"📊 FINAL RESULT")
+    log_lines.append("📊 FINAL RESULT")
     log_lines.append(f"  Total Reward: {state.total_reward:+.1f}")
     log_lines.append(f"  Fixed: {'✅ YES' if state.is_fixed else '❌ NO'}")
     log_lines.append(f"  Steps Used: {state.step_count}/{demo_obs.max_steps}")
     log_lines.append(f"{'=' * 60}")
 
-    yield _format_autoplay_output(log_lines, state, demo_obs)
+    return _format_autoplay_output(log_lines, state, demo_obs)
 
 
-def _run_fallback_scripted(log_lines, state):
+def _run_fallback_scripted(log_lines):
     """Fallback scripted agent when model can't load (e.g., CPU mode)."""
     global demo_env, demo_obs
 
@@ -423,23 +419,23 @@ def _run_fallback_scripted(log_lines, state):
     state = demo_env.state()
 
     log_lines.append(f"\n{'=' * 60}")
-    log_lines.append(f"📊 RESULT (Scripted Agent)")
+    log_lines.append("📊 RESULT (Scripted Agent Fallback)")
     log_lines.append(f"  Total Reward: {state.total_reward:+.1f}")
     log_lines.append(f"  Fixed: {'✅ YES' if state.is_fixed else '❌ NO'}")
     log_lines.append(f"{'=' * 60}")
 
-    yield _format_autoplay_output(log_lines, state, demo_obs)
+    return _format_autoplay_output(log_lines, state, demo_obs)
 
 
 def _format_autoplay_output(log_lines, state, obs):
     """Format outputs for the autoplay UI update."""
-    done_str = " | **DONE**" if state.is_done else ""
+    done_str = " | **DONE**" if state.done else ""
     fixed_str = " ✅ FIXED!" if state.is_fixed else ""
     status = f"🤖 Auto-Play | Step {state.step_count}/{obs.max_steps} | Total: {state.total_reward:+.1f}{done_str}{fixed_str}"
     schema = obs.schema_snapshot
     error = obs.error_log
     query = obs.failing_query
-    history = "\n".join(log_lines[-30:])
+    history = "\n".join(log_lines[-40:])
     reward = f"{state.total_reward:+.1f}"
     return status, schema, error, query, history, reward
 
