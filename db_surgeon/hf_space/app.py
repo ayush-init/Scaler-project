@@ -72,10 +72,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ─── Add project to path ───
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from db_surgeon.models import DBSurgeonAction
+# ═══════════════════════════════════════════════════════════════
+# UNIFIED DEMO PIPELINE (imported)
+# ═══════════════════════════════════════════════════════════════
+
+from unified_pipeline import (
+    _load_trained_model,
+    load_sample_db, load_user_db,
+    generate_broken_db_and_compare,
+    ask_question,
+    SAMPLE_DB_SQL,
+    _execute_sql_to_db,
+)
+
 from db_surgeon.client import DBSurgeonLocalEnv
+from db_surgeon.models import DBSurgeonAction
 from db_surgeon.training.tool_env import DBSurgeonToolEnv
 
 # ═══════════════════════════════════════════════════════════════
@@ -1137,117 +1150,77 @@ with gr.Blocks(
     theme=gr.themes.Soft(primary_hue="indigo", secondary_hue="purple"),
 ) as app:
 
-    gr.Markdown("# 🏥 DB-Surgeon — Database Surgery RL Environment")
-    gr.Markdown("An RL environment where an LLM learns to diagnose and fix broken database schemas.")
+    gr.Markdown("# 🏥 DB-Surgeon — Database AI Assistant")
+    gr.Markdown("An RL-trained 0.6B LLM that acts as a unified database expert: it diagnoses schema bugs, fixes them autonomously, and translates natural language queries into SQL (in any language)!")
 
     with gr.Tabs():
 
-        # ─── TAB 1: INTERACTIVE DEMO ───
-        with gr.Tab("🎮 Interactive Demo"):
-            gr.Markdown("### Try fixing a broken database yourself!")
-
+        # ─── TAB 1: UNIFIED PIPELINE ───
+        with gr.Tab("🏥 Main Demo Pipeline"):
+            
+            gr.Markdown("## Step 1: Input Database Schema")
+            gr.Markdown("Provide a broken or working database schema (CREATE TABLE and INSERT statements).")
+            
             with gr.Row():
-                demo_status = gr.Markdown("Click **Reset** to start a new episode.")
-                demo_reward = gr.Textbox(label="Total Reward", value="0.0", interactive=False, scale=0)
-
-            reset_btn = gr.Button("🔄 Reset (New Episode)", variant="primary")
-
-            with gr.Row():
-                with gr.Column(scale=2):
-                    demo_schema = gr.Textbox(label="Database Schema", lines=12, interactive=False)
+                db_input = gr.Textbox(label="Paste SQL schema here", lines=10, placeholder="CREATE TABLE ...", scale=3)
                 with gr.Column(scale=1):
-                    demo_error = gr.Textbox(label="Error Log", lines=6, interactive=False)
-                    demo_query = gr.Textbox(label="Failing Business Query", lines=6, interactive=False)
-
-            gr.Markdown("### Execute a Tool")
-            with gr.Row():
-                tool_select = gr.Dropdown(
-                    choices=["inspect_schema", "run_query", "fix_column", "execute_fix", "add_index", "submit"],
-                    value="inspect_schema", label="Tool", scale=1
-                )
-                tool_arg1 = gr.Textbox(label="Arg 1 (table_name / sql)", placeholder="Leave empty for all tables", scale=2)
-                tool_arg2 = gr.Textbox(label="Arg 2 (column_name)", placeholder="For fix_column", scale=1)
-                tool_arg3 = gr.Textbox(label="Arg 3 (new_type / new_name)", placeholder="INTEGER, TEXT, or new name", scale=1)
-
-            action_btn = gr.Button("▶️ Execute Tool", variant="secondary")
-            demo_history = gr.Textbox(label="Action History", lines=12, interactive=False)
-
+                    load_sample_btn = gr.Button("🗄️ Load Sample DB", variant="secondary")
+                    load_user_btn = gr.Button("✅ Load User DB", variant="primary")
+                    generate_broken_btn = gr.Button("🎲 Generate Broken DB", variant="stop")
+            
+            db_status = gr.Markdown("")
+            
             gr.Markdown("---")
-            gr.Markdown("### 🤖 Or let the Trained Model solve it automatically")
-            gr.Markdown("Loads `ayush0211/db-surgeon-qwen3-0.6b-grpo` and watches it diagnose & fix the database in real-time.")
-            autoplay_btn = gr.Button("🤖 Auto-Play with Trained Model", variant="primary", size="lg")
-
-            reset_btn.click(
-                demo_reset,
-                outputs=[demo_status, demo_schema, demo_error, demo_query, demo_history, demo_reward],
-            )
-            action_btn.click(
-                demo_action,
-                inputs=[tool_select, tool_arg1, tool_arg2, tool_arg3],
-                outputs=[demo_status, demo_schema, demo_error, demo_query, demo_history, demo_reward],
-            )
-            autoplay_btn.click(
-                auto_play_model,
-                outputs=[demo_status, demo_schema, demo_error, demo_query, demo_history, demo_reward],
-            )
-
-        # ─── TAB 2: NATURAL LANGUAGE TO SQL ───
-        with gr.Tab("💬 Ask in Any Language"):
-            gr.Markdown("### Ask questions about a database in any language — Hindi, English, or anything!")
-            gr.Markdown("The trained model converts your natural language question into SQL, runs it, and shows results.")
-
+            gr.Markdown("## Step 2: Database Diagnosis & Repair (Before vs After)")
+            gr.Markdown("See how RL training transformed Qwen3-0.6B from a generic model into a Database Surgeon.")
+            
             with gr.Row():
-                with gr.Column(scale=2):
-                    nl2sql_schema_display = gr.Textbox(
-                        label="📊 Database Schema",
-                        lines=15, interactive=False,
-                        placeholder="Click 'Load Database' to see the schema..."
-                    )
-                with gr.Column(scale=1):
-                    gr.Markdown("**Example questions:**")
-                    gr.Markdown("""
-- Show all employees from Mumbai
-- सबसे ज्यादा सैलरी किसकी है?
-- Engineering department ka budget kitna hai?
-- List products with total sales above 30000
-- कौन से projects active हैं?
-- Which region has the most sales?
-- मुंबई में कितने employees हैं?
-""")
-
-            load_db_btn = gr.Button("🗄️ Load Database", variant="primary")
-            nl2sql_db_status = gr.Markdown("")
-
+                with gr.Column():
+                    base_model_out = gr.Textbox(label="❌ Base Model (Qwen3-0.6B without RL)", lines=12, interactive=False)
+                with gr.Column():
+                    trained_model_out = gr.Textbox(label="✅ Trained Model (DB-Surgeon with GRPO)", lines=12, interactive=False)
+            
             gr.Markdown("---")
-
+            gr.Markdown("## Step 3 & 4: Ask Questions & Get Remarks")
+            gr.Markdown("Now that the database is healthy, ask questions in **any language** (Hindi, English, etc).")
+            
             with gr.Row():
-                nl2sql_input = gr.Textbox(
-                    label="🗣️ Your Question (any language)",
-                    placeholder="e.g., 'Show me all employees with salary above 80000' or 'सबसे ज्यादा सैलरी किसकी है?'",
-                    lines=2, scale=4,
-                )
+                nl2sql_input = gr.Textbox(label="🗣️ Your Question", placeholder="e.g. 'Show me all employees in Mumbai' or 'सबसे ज्यादा सैलरी किसकी है?'", lines=2, scale=4)
                 nl2sql_btn = gr.Button("🔍 Ask", variant="primary", scale=1)
-
+                
             nl2sql_status = gr.Markdown("")
-            nl2sql_generated_sql = gr.Textbox(label="🤖 Generated SQL", lines=3, interactive=False)
-            nl2sql_results = gr.Textbox(label="📋 Query Results", lines=12, interactive=False, show_copy_button=True)
-
-            load_db_btn.click(
-                nl2sql_reset_db,
-                outputs=[nl2sql_schema_display, nl2sql_db_status],
+            nl2sql_sql = gr.Textbox(label="🤖 Generated SQL", lines=3, interactive=False)
+            nl2sql_results = gr.Textbox(label="📋 Query Results", lines=10, interactive=False)
+            nl2sql_remarks = gr.Textbox(label="💡 AI Remarks", lines=3, interactive=False)
+            
+            # Wire up events
+            load_sample_btn.click(
+                load_sample_db,
+                outputs=[db_input, base_model_out, db_status] # using base_model_out as temp for schema to avoid UI clutter
             )
+            load_user_btn.click(
+                load_user_db,
+                inputs=[db_input],
+                outputs=[base_model_out, db_status]
+            )
+            generate_broken_btn.click(
+                generate_broken_db_and_compare,
+                outputs=[db_input, db_status, base_model_out, trained_model_out]
+            )
+            
             nl2sql_btn.click(
-                nl2sql_query,
+                ask_question,
                 inputs=[nl2sql_input],
-                outputs=[nl2sql_status, nl2sql_generated_sql, nl2sql_results],
+                outputs=[nl2sql_status, nl2sql_sql, nl2sql_results, nl2sql_remarks]
             )
             nl2sql_input.submit(
-                nl2sql_query,
+                ask_question,
                 inputs=[nl2sql_input],
-                outputs=[nl2sql_status, nl2sql_generated_sql, nl2sql_results],
+                outputs=[nl2sql_status, nl2sql_sql, nl2sql_results, nl2sql_remarks]
             )
 
-        # ─── TAB 3: TRAINING ───
+
+        # ─── TAB 2: TRAINING ───
         with gr.Tab("🚀 Training"):
             gr.Markdown("### Train an LLM to fix databases using GRPO + Unsloth")
             gr.Markdown("This runs GRPO training with your HuggingFace GPU. **$30 budget = ~30 hours of A10G.**")
