@@ -480,7 +480,7 @@ def nl2sql_reset_db():
     global _nl2sql_db, _nl2sql_schema
     import sqlite3
 
-    _nl2sql_db = sqlite3.connect(":memory:")
+    _nl2sql_db = sqlite3.connect(":memory:", check_same_thread=False)
 
     schema_sql = """
 CREATE TABLE employees (
