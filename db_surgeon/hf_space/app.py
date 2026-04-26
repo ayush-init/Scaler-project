@@ -588,6 +588,79 @@ INSERT INTO sales VALUES (8, 7, 'Mega Suite', 52000, '2024-03-15', 'South');
     return _nl2sql_schema, "✅ Fresh database loaded! You can now ask questions in any language."
 
 
+def _extract_sql_from_response(response):
+    """Extract SQL from model response, handling various output formats.
+    
+    The model may output SQL in different ways:
+    1. Clean SQL after </think> block
+    2. SQL inside ```sql ... ``` code fences
+    3. SQL mixed with explanation text
+    4. Everything inside <think> with SQL keywords
+    """
+    # Strategy 1: Try text OUTSIDE <think> blocks
+    outside_think = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+    outside_think = re.sub(r'<think>.*$', '', outside_think, flags=re.DOTALL)
+    outside_think = outside_think.strip()
+    
+    if outside_think:
+        sql = _clean_sql(outside_think)
+        if sql:
+            return sql
+    
+    # Strategy 2: Look for SQL inside ```sql ... ``` code blocks (anywhere in response)
+    code_block = re.search(r'```sql\s*(.*?)\s*```', response, re.DOTALL)
+    if code_block:
+        sql = _clean_sql(code_block.group(1))
+        if sql:
+            return sql
+    
+    # Strategy 3: Look for SQL keywords in the FULL response (including think blocks)
+    # Find SELECT/INSERT/UPDATE/DELETE/ALTER/CREATE statements
+    sql_patterns = [
+        r'(SELECT\s+.+?(?:FROM\s+.+?)(?:;|$))',
+        r'(INSERT\s+INTO\s+.+?(?:;|$))',
+        r'(UPDATE\s+.+?SET\s+.+?(?:;|$))',
+        r'(DELETE\s+FROM\s+.+?(?:;|$))',
+        r'(ALTER\s+TABLE\s+.+?(?:;|$))',
+        r'(CREATE\s+TABLE\s+.+?(?:;|$))',
+    ]
+    
+    for pattern in sql_patterns:
+        match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
+        if match:
+            sql = match.group(1).strip()
+            # Clean up: remove trailing text after the SQL statement
+            # Stop at common non-SQL text markers
+            for stop_marker in ['\n\n', '\nThis', '\nThe', '\nNote', '\nI ', '\nSo']:
+                if stop_marker in sql:
+                    sql = sql[:sql.index(stop_marker)]
+            sql = sql.strip().rstrip(';') + ';'
+            if len(sql) > 10:  # Minimum viable SQL
+                return sql
+    
+    return None
+
+
+def _clean_sql(text):
+    """Clean extracted SQL text."""
+    # Remove markdown fences
+    text = re.sub(r'^```sql\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^```\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\s*```\s*$', '', text, flags=re.MULTILINE)
+    text = text.strip()
+    
+    # Take only the first SQL statement if multiple
+    if text and ';' in text:
+        text = text.split(';')[0] + ';'
+    
+    # Validate it looks like SQL
+    sql_keywords = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ALTER', 'CREATE', 'DROP']
+    if text and any(text.upper().lstrip().startswith(kw) for kw in sql_keywords):
+        return text
+    
+    return None
+
+
 def nl2sql_query(user_question):
     """Convert natural language question to SQL and execute it."""
     global _nl2sql_db, _nl2sql_schema
@@ -642,23 +715,11 @@ SQL QUERY:"""
 
         response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
 
-        # Clean up: strip thinking blocks and extract SQL
-        sql = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
-        sql = re.sub(r'<think>.*$', '', sql, flags=re.DOTALL)
-        sql = sql.strip()
-
-        # Remove markdown code fences if present
-        sql = re.sub(r'^```sql\s*', '', sql)
-        sql = re.sub(r'^```\s*', '', sql)
-        sql = re.sub(r'\s*```$', '', sql)
-        sql = sql.strip()
-
-        # Take only the first SQL statement
-        if ";" in sql:
-            sql = sql.split(";")[0] + ";"
+        # Extract SQL from model response
+        sql = _extract_sql_from_response(response)
         
         if not sql:
-            return "⚠️ Model didn't generate a SQL query. Try rephrasing.", "", ""
+            return "⚠️ Model didn't generate a SQL query. Try rephrasing.", f"Raw model output:\n{response[:500]}", ""
 
     except Exception as e:
         return f"❌ Generation error: {e}", "", ""
