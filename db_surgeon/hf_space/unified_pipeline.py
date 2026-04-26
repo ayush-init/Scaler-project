@@ -155,25 +155,11 @@ def _execute_sql(sql_text):
     return conn, schema_text, errors
 
 
-def _check_db_health(conn, sql_text):
+def _check_db_health(conn, load_errors):
     """Check if database has any issues. Returns (is_healthy, error_list)."""
-    errors = []
+    errors = list(load_errors)  # start with any errors from loading
     
-    # Check 1: Were there SQL execution errors during loading?
-    load_errors = []
-    for stmt in sql_text.strip().split(";"):
-        stmt = stmt.strip()
-        if not stmt:
-            continue
-        try:
-            test_conn = sqlite3.connect(":memory:")
-            test_conn.execute(stmt)
-            test_conn.close()
-        except Exception as e:
-            if "already exists" not in str(e):
-                load_errors.append(str(e))
-    
-    # Check 2: Try some common queries on all tables
+    # Check: Can we query all tables?
     cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = [row[0] for row in cursor.fetchall()]
     
@@ -183,7 +169,7 @@ def _check_db_health(conn, sql_text):
         except Exception as e:
             errors.append(f"Table '{t}': {e}")
 
-    # Check 3: Foreign key integrity
+    # Check: Foreign key integrity
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -192,8 +178,7 @@ def _check_db_health(conn, sql_text):
     except:
         pass
 
-    all_errors = load_errors + errors
-    return len(all_errors) == 0, all_errors
+    return len(errors) == 0, errors
 
 
 def _format_table(cursor):
@@ -431,23 +416,7 @@ def run_full_pipeline(db_sql, user_question):
     if not schema_text.strip():
         return "❌ Could not parse any tables from your SQL. Please check the syntax.", "", ""
 
-    # Also use the RL environment to check for structural bugs
-    use_env = False
-    env = None
-    try:
-        env = DBSurgeonLocalEnv()
-        # Try to see if this SQL creates a broken scenario via the env
-        # We use the environment's built-in bug detection
-    except:
-        pass
-
-    is_healthy, health_errors = _check_db_health(conn, db_sql)
-    
-    # Also check if the user specifically loaded a broken sample (by trying to use env)
-    # We detect "broken" by checking if load_errors is non-empty
-    if load_errors:
-        is_healthy = False
-        health_errors = load_errors + health_errors
+    is_healthy, health_errors = _check_db_health(conn, load_errors)
 
     if is_healthy:
         log.append("✅ Database is healthy — no errors detected!")
