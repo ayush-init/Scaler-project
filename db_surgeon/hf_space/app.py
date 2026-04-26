@@ -72,19 +72,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # ─── Add project to path ───
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _this_dir)
+sys.path.insert(0, os.path.dirname(os.path.dirname(_this_dir)))
 
 # ═══════════════════════════════════════════════════════════════
 # UNIFIED DEMO PIPELINE (imported)
 # ═══════════════════════════════════════════════════════════════
 
 from unified_pipeline import (
-    _load_trained_model,
-    load_sample_db, load_user_db,
-    generate_broken_db_and_compare,
-    ask_question,
-    SAMPLE_DB_SQL,
-    _execute_sql_to_db,
+    run_full_pipeline,
+    get_sample_healthy,
+    get_sample_broken,
 )
 
 from db_surgeon.client import DBSurgeonLocalEnv
@@ -136,7 +135,7 @@ def demo_reset():
 def demo_action(tool_name, arg1, arg2, arg3):
     global demo_env, demo_obs
     if demo_env is None:
-        return "⚠️ Click 'Reset' first!", "", "", "", "No episode running.", "0.0"
+        return " Click 'Reset' first!", "", "", "", "No episode running.", "0.0"
 
     # Build action based on tool
     args = {}
@@ -167,7 +166,7 @@ def demo_action(tool_name, arg1, arg2, arg3):
     state = demo_env.state()
 
     done_str = " | **DONE**" if result.done else ""
-    fixed_str = " ✅ FIXED!" if state.is_fixed else ""
+    fixed_str = "  FIXED!" if state.is_fixed else ""
     status = f"Step {state.step_count}/{demo_obs.max_steps} | Reward: {result.reward:+.1f} | Total: {state.total_reward:+.1f}{done_str}{fixed_str}"
 
     history = "\n".join(demo_obs.action_history[-10:])  # Last 10 actions
@@ -308,7 +307,7 @@ def auto_play_model():
 
     # Step 1: Reset environment
     log_lines.append("=" * 60)
-    log_lines.append("🤖 TRAINED MODEL AUTO-PLAY")
+    log_lines.append("TRAINED MODEL AUTO-PLAY")
     log_lines.append("=" * 60)
 
     demo_env = DBSurgeonLocalEnv()
@@ -316,9 +315,9 @@ def auto_play_model():
     demo_obs = result.observation
     state = demo_env.state()
 
-    log_lines.append(f"\n📋 Bug Type: {state.initial_bug_type}")
-    log_lines.append(f"📋 Failing Query: {demo_obs.failing_query[:100]}...")
-    log_lines.append(f"📋 Error: {demo_obs.error_log[:100]}...")
+    log_lines.append(f"\n Bug Type: {state.initial_bug_type}")
+    log_lines.append(f"Failing Query: {demo_obs.failing_query[:100]}...")
+    log_lines.append(f"Error: {demo_obs.error_log[:100]}...")
 
     # Step 2: Load model
     log_lines.append("\n⏳ Loading trained model...")
@@ -327,10 +326,10 @@ def auto_play_model():
 
     try:
         model, tokenizer = _load_trained_model()
-        log_lines.append("✅ Model loaded!")
+        log_lines.append("Model loaded!")
     except Exception as e:
-        log_lines.append(f"❌ Model load failed: {e}")
-        log_lines.append("\n🔧 Falling back to scripted agent...")
+        log_lines.append(f"Model load failed: {e}")
+        log_lines.append("\n Falling back to scripted agent...")
         return _run_fallback_scripted(log_lines)
 
     # Step 3: Generate & execute actions
@@ -340,7 +339,7 @@ def auto_play_model():
             break
 
         log_lines.append(f"\n{'─' * 40}")
-        log_lines.append(f"🔄 Turn {turn + 1}/{max_turns}")
+        log_lines.append(f"Turn {turn + 1}/{max_turns}")
 
         # Build prompt from current observation
         prompt = f"""You are a database engineer fixing a broken database.
@@ -377,40 +376,40 @@ Diagnose the issue and fix it. Call the appropriate tool."""
                 )
 
             response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-            log_lines.append(f"🧠 Model says:\n{response[:400]}{'...' if len(response) > 400 else ''}")
+            log_lines.append(f" Model says:\n{response[:400]}{'...' if len(response) > 400 else ''}")
 
         except Exception as e:
-            log_lines.append(f"❌ Generation error: {e}")
+            log_lines.append(f" Generation error: {e}")
             break
 
         # Parse and execute tool calls
         tool_calls = _parse_tool_calls(response, turn_number=turn)
         if not tool_calls:
-            log_lines.append("⚠️ No tool calls found, trying inspect_schema...")
+            log_lines.append("No tool calls found, trying inspect_schema...")
             tool_calls = [("inspect_schema", {})]
 
         for tool_name, args in tool_calls:
             if result.done:
                 break
-            log_lines.append(f"\n  🔧 Executing: {tool_name}({args})")
+            log_lines.append(f"\n  Executing: {tool_name}({args})")
             try:
                 action = DBSurgeonAction(tool_name=tool_name, arguments=args)
                 result = demo_env.step(action)
                 demo_obs = result.observation
                 state = demo_env.state()
-                log_lines.append(f"  📊 Reward: {result.reward:+.1f} | Total: {state.total_reward:+.1f}")
+                log_lines.append(f"  Reward: {result.reward:+.1f} | Total: {state.total_reward:+.1f}")
                 if result.done:
                     if state.is_fixed:
-                        log_lines.append("  🎉 DATABASE FIXED!")
+                        log_lines.append("  DATABASE FIXED!")
                     else:
-                        log_lines.append("  ❌ Episode ended (not fixed)")
+                        log_lines.append("  Episode ended (not fixed)")
             except Exception as e:
-                log_lines.append(f"  ❌ Action error: {e}")
+                log_lines.append(f"  Action error: {e}")
 
     # Final status
     if not result.done:
         log_lines.append(f"\n{'─' * 40}")
-        log_lines.append("⏰ Max turns reached, submitting...")
+        log_lines.append("Max turns reached, submitting...")
         result = demo_env.step(DBSurgeonAction("submit", {}))
         demo_obs = result.observation
         state = demo_env.state()
@@ -418,7 +417,7 @@ Diagnose the issue and fix it. Call the appropriate tool."""
     log_lines.append(f"\n{'=' * 60}")
     log_lines.append("📊 FINAL RESULT")
     log_lines.append(f"  Total Reward: {state.total_reward:+.1f}")
-    log_lines.append(f"  Fixed: {'✅ YES' if state.is_fixed else '❌ NO'}")
+    log_lines.append(f"  Fixed: {'YES' if state.is_fixed else ' NO'}")
     log_lines.append(f"  Steps Used: {state.step_count}/{demo_obs.max_steps}")
     log_lines.append(f"{'=' * 60}")
 
@@ -461,7 +460,7 @@ def _run_fallback_scripted(log_lines):
     log_lines.append(f"\n{'=' * 60}")
     log_lines.append("📊 RESULT (Scripted Agent Fallback)")
     log_lines.append(f"  Total Reward: {state.total_reward:+.1f}")
-    log_lines.append(f"  Fixed: {'✅ YES' if state.is_fixed else '❌ NO'}")
+    log_lines.append(f"  Fixed: {' YES' if state.is_fixed else ' NO'}")
     log_lines.append(f"{'=' * 60}")
 
     return _format_autoplay_output(log_lines, state, demo_obs)
@@ -470,8 +469,8 @@ def _run_fallback_scripted(log_lines):
 def _format_autoplay_output(log_lines, state, obs):
     """Format outputs for the autoplay UI update."""
     done_str = " | **DONE**" if state.done else ""
-    fixed_str = " ✅ FIXED!" if state.is_fixed else ""
-    status = f"🤖 Auto-Play | Step {state.step_count}/{obs.max_steps} | Total: {state.total_reward:+.1f}{done_str}{fixed_str}"
+    fixed_str = "  FIXED!" if state.is_fixed else ""
+    status = f" Auto-Play | Step {state.step_count}/{obs.max_steps} | Total: {state.total_reward:+.1f}{done_str}{fixed_str}"
     schema = obs.schema_snapshot
     error = obs.error_log
     query = obs.failing_query
@@ -732,10 +731,10 @@ SQL QUERY:"""
         sql = _extract_sql_from_response(response)
         
         if not sql:
-            return "⚠️ Model didn't generate a SQL query. Try rephrasing.", f"Raw model output:\n{response[:500]}", ""
+            return " Model didn't generate a SQL query. Try rephrasing.", f"Raw model output:\n{response[:500]}", ""
 
     except Exception as e:
-        return f"❌ Generation error: {e}", "", ""
+        return f" Generation error: {e}", "", ""
 
     # Step 3: Execute the SQL
     try:
@@ -762,10 +761,10 @@ SQL QUERY:"""
             result_lines.append(f"\n({len(rows)} rows returned)")
             result_text = "\n".join(result_lines)
 
-        return f"✅ Query executed successfully!", sql, result_text
+        return f" Query executed successfully!", sql, result_text
 
     except Exception as e:
-        return f"❌ SQL Error: {e}", sql, f"The generated SQL had an error:\n{e}\n\nTry rephrasing your question."
+        return f" SQL Error: {e}", sql, f"The generated SQL had an error:\n{e}\n\nTry rephrasing your question."
 
 # ═══════════════════════════════════════════════════════════════
 # TAB 2: TRAINING
@@ -825,7 +824,7 @@ def run_baseline():
 def run_training(num_episodes, model_name, learning_rate):
     """Run GRPO training in a background thread."""
     if training_state["running"]:
-        return "⚠️ Training already in progress!"
+        return "Training already in progress!"
 
     training_state["running"] = True
     training_state["progress"] = 0
@@ -1015,7 +1014,7 @@ def run_training(num_episodes, model_name, learning_rate):
 
     thread = threading.Thread(target=_train, daemon=True)
     thread.start()
-    return "🚀 Training started! Check the log below for progress."
+    return " Training started! Check the log below for progress."
 
 
 def get_training_status():
@@ -1026,13 +1025,13 @@ def get_training_status():
         elapsed = f" | Elapsed: {secs/60:.1f}min"
 
     if training_state["error"]:
-        status = f"❌ Error{elapsed}"
+        status = f" Error{elapsed}"
     elif training_state["completed"]:
-        status = f"✅ Training Complete!{elapsed}"
+        status = f" Training Complete!{elapsed}"
     elif training_state["running"]:
-        status = f"🔄 Training in progress...{elapsed}"
+        status = f" Training in progress...{elapsed}"
     else:
-        status = "⏸️ Not started"
+        status = " Not started"
 
     log_text = "\n".join(training_state["log"][-30:])  # Last 30 lines
     return status, log_text
@@ -1156,72 +1155,69 @@ with gr.Blocks(
     with gr.Tabs():
 
         # ─── TAB 1: UNIFIED PIPELINE ───
-        with gr.Tab("🏥 Main Demo Pipeline"):
+        with gr.Tab("🏥 DB-Surgeon Pipeline"):
             
-            gr.Markdown("## Step 1: Input Database Schema")
-            gr.Markdown("Provide a broken or working database schema (CREATE TABLE and INSERT statements).")
+            gr.Markdown("### Paste a database, ask a question — watch AI handle everything.")
+            gr.Markdown("If your database has errors, the model will **detect and fix** them first, then **generate SQL** from your question and **show results**.")
             
             with gr.Row():
-                db_input = gr.Textbox(label="Paste SQL schema here", lines=10, placeholder="CREATE TABLE ...", scale=3)
+                with gr.Column(scale=2):
+                    db_input = gr.Textbox(
+                        label="📋 Your Database SQL",
+                        lines=10,
+                        placeholder="Paste CREATE TABLE + INSERT statements here...",
+                    )
+                    with gr.Row():
+                        load_healthy_btn = gr.Button("🗄️ Load Healthy Sample", variant="secondary", size="sm")
+                        load_broken_btn = gr.Button("🎲 Load Broken Sample", variant="stop", size="sm")
                 with gr.Column(scale=1):
-                    load_sample_btn = gr.Button("🗄️ Load Sample DB", variant="secondary")
-                    load_user_btn = gr.Button("✅ Load User DB", variant="primary")
-                    generate_broken_btn = gr.Button("🎲 Generate Broken DB", variant="stop")
-            
-            db_status = gr.Markdown("")
-            
-            gr.Markdown("---")
-            gr.Markdown("## Step 2: Database Diagnosis & Repair (Before vs After)")
-            gr.Markdown("See how RL training transformed Qwen3-0.6B from a generic model into a Database Surgeon.")
-            
-            with gr.Row():
-                with gr.Column():
-                    base_model_out = gr.Textbox(label="❌ Base Model (Qwen3-0.6B without RL)", lines=12, interactive=False)
-                with gr.Column():
-                    trained_model_out = gr.Textbox(label="✅ Trained Model (DB-Surgeon with GRPO)", lines=12, interactive=False)
+                    question_input = gr.Textbox(
+                        label="🗣️ Your Question (any language)",
+                        lines=3,
+                        placeholder="e.g. 'Show all employees from Mumbai'\nor 'सबसे ज्यादा salary किसकी है?'",
+                    )
+                    run_btn = gr.Button("🚀 Run Pipeline", variant="primary", size="lg")
             
             gr.Markdown("---")
-            gr.Markdown("## Step 3 & 4: Ask Questions & Get Remarks")
-            gr.Markdown("Now that the database is healthy, ask questions in **any language** (Hindi, English, etc).")
             
-            with gr.Row():
-                nl2sql_input = gr.Textbox(label="🗣️ Your Question", placeholder="e.g. 'Show me all employees in Mumbai' or 'सबसे ज्यादा सैलरी किसकी है?'", lines=2, scale=4)
-                nl2sql_btn = gr.Button("🔍 Ask", variant="primary", scale=1)
-                
-            nl2sql_status = gr.Markdown("")
-            nl2sql_sql = gr.Textbox(label="🤖 Generated SQL", lines=3, interactive=False)
-            nl2sql_results = gr.Textbox(label="📋 Query Results", lines=10, interactive=False)
-            nl2sql_remarks = gr.Textbox(label="💡 AI Remarks", lines=3, interactive=False)
-            
-            # Wire up events
-            load_sample_btn.click(
-                load_sample_db,
-                outputs=[db_input, base_model_out, db_status] # using base_model_out as temp for schema to avoid UI clutter
-            )
-            load_user_btn.click(
-                load_user_db,
-                inputs=[db_input],
-                outputs=[base_model_out, db_status]
-            )
-            generate_broken_btn.click(
-                generate_broken_db_and_compare,
-                outputs=[db_input, db_status, base_model_out, trained_model_out]
+            pipeline_log = gr.Textbox(
+                label=" Pipeline Log",
+                lines=20,
+                interactive=False,
+                show_copy_button=True,
             )
             
-            nl2sql_btn.click(
-                ask_question,
-                inputs=[nl2sql_input],
-                outputs=[nl2sql_status, nl2sql_sql, nl2sql_results, nl2sql_remarks]
+            score_display = gr.Markdown("")
+            
+            verdict_box = gr.Textbox(
+                label=" AI Verdict",
+                lines=3,
+                interactive=False,
             )
-            nl2sql_input.submit(
-                ask_question,
-                inputs=[nl2sql_input],
-                outputs=[nl2sql_status, nl2sql_sql, nl2sql_results, nl2sql_remarks]
+            
+            # ─── Wire events ───
+            load_healthy_btn.click(
+                get_sample_healthy,
+                outputs=[db_input],
+            )
+            load_broken_btn.click(
+                get_sample_broken,
+                outputs=[db_input],
+            )
+            run_btn.click(
+                run_full_pipeline,
+                inputs=[db_input, question_input],
+                outputs=[pipeline_log, score_display, verdict_box],
+            )
+            question_input.submit(
+                run_full_pipeline,
+                inputs=[db_input, question_input],
+                outputs=[pipeline_log, score_display, verdict_box],
             )
 
 
         # ─── TAB 2: TRAINING ───
-        with gr.Tab("🚀 Training"):
+        with gr.Tab("Training"):
             gr.Markdown("### Train an LLM to fix databases using GRPO + Unsloth")
             gr.Markdown("This runs GRPO training with your HuggingFace GPU. **$30 budget = ~30 hours of A10G.**")
 
@@ -1235,11 +1231,11 @@ with gr.Blocks(
                 lr_input = gr.Number(value=5e-6, label="Learning Rate")
 
             with gr.Row():
-                train_btn = gr.Button("🚀 Start Training", variant="primary", scale=2)
-                status_btn = gr.Button("🔄 Refresh Status", scale=1)
-                plot_btn = gr.Button("📊 Show Plot", scale=1)
+                train_btn = gr.Button(" Start Training", variant="primary", scale=2)
+                status_btn = gr.Button(" Refresh Status", scale=1)
+                plot_btn = gr.Button("Show Plot", scale=1)
 
-            train_status = gr.Markdown("⏸️ Not started")
+            train_status = gr.Markdown("Not started")
             train_log = gr.Textbox(label="Training Log", lines=15, interactive=False)
             train_plot = gr.Image(label="Training Metrics", height=400)
 
@@ -1258,13 +1254,13 @@ with gr.Blocks(
             )
 
         # ─── TAB 3: QUICK TEST ───
-        with gr.Tab("🧪 Quick Test"):
+        with gr.Tab("Quick Test"):
             gr.Markdown("### Test the environment with a scripted agent")
             gr.Markdown("Runs a smart scripted agent that reads the root cause and applies the correct fix.")
 
             with gr.Row():
                 test_n = gr.Number(value=10, label="Number of Episodes", minimum=1, maximum=100)
-                test_btn = gr.Button("▶️ Run Test", variant="primary")
+                test_btn = gr.Button("Run Test", variant="primary")
 
             test_output = gr.Textbox(label="Results", lines=20, interactive=False, show_copy_button=True)
             test_btn.click(run_scripted_test, inputs=[test_n], outputs=[test_output])

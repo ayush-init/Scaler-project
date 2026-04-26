@@ -1,24 +1,30 @@
 # ═══════════════════════════════════════════════════════════════
-# UNIFIED DEMO PIPELINE
+# UNIFIED PIPELINE — Single Flow
+# User gives DB + question → detect errors → fix → query → score
 # ═══════════════════════════════════════════════════════════════
 
+import os, sys
 import sqlite3
 import re
+
+# ─── Path setup (works on both HF Spaces and local) ───
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+# On HF:  /home/user/app/unified_pipeline.py  → need /home/user/app on path
+# Local:  e:\Scaler\db_surgeon\hf_space\unified_pipeline.py → need e:\Scaler on path
+sys.path.insert(0, _this_dir)                                           # for HF
+sys.path.insert(0, os.path.dirname(os.path.dirname(_this_dir)))         # for local
+
 from db_surgeon.client import DBSurgeonLocalEnv
 from db_surgeon.models import DBSurgeonAction
 
-# Global state for the unified pipeline
-_active_db = None  # sqlite3 connection
-_active_schema_text = ""  # Human-readable schema description
-_active_schema_sql = ""   # Raw CREATE TABLE statements
-
-# ─── Model Loading (cached) ───
+# ═══════════════════════════════════════════════════════════════
+# MODEL LOADING (cached singleton)
+# ═══════════════════════════════════════════════════════════════
 
 _trained_model = None
 _trained_tokenizer = None
 
 def _load_trained_model():
-    """Load the trained model from HuggingFace Hub (cached)."""
     global _trained_model, _trained_tokenizer
     if _trained_model is not None:
         return _trained_model, _trained_tokenizer
@@ -41,15 +47,14 @@ def _load_trained_model():
             torch_dtype=torch.float16,
             device_map="auto",
         )
-
     return _trained_model, _trained_tokenizer
 
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 1: DATABASE INPUT
+# SAMPLE DATABASES
 # ═══════════════════════════════════════════════════════════════
 
-SAMPLE_DB_SQL = """
+SAMPLE_HEALTHY_SQL = """
 CREATE TABLE employees (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL, department TEXT NOT NULL,
     salary REAL NOT NULL, hire_date TEXT NOT NULL, city TEXT NOT NULL, age INTEGER
@@ -104,288 +109,95 @@ INSERT INTO sales VALUES (8,7,'Mega Suite',52000,'2024-03-15','South');
 """
 
 
-def _execute_sql_to_db(sql_text):
-    """Execute SQL statements into a fresh in-memory SQLite database."""
-    global _active_db, _active_schema_text, _active_schema_sql
-    
-    _active_db = sqlite3.connect(":memory:", check_same_thread=False)
-    
-    # Split and execute each statement
+def get_sample_healthy():
+    """Return sample healthy SQL for the textbox."""
+    return SAMPLE_HEALTHY_SQL.strip()
+
+
+def get_sample_broken():
+    """Generate a broken DB scenario using the RL environment and return the SQL."""
+    env = DBSurgeonLocalEnv()
+    result = env.reset()
+    scenario = env._env._scenario
+    return scenario.schema_sql + "\n" + scenario.seed_data_sql
+
+
+# ═══════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
+
+def _execute_sql(sql_text):
+    """Execute SQL into an in-memory SQLite DB. Returns (conn, schema_text, errors)."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
     errors = []
     for stmt in sql_text.strip().split(";"):
         stmt = stmt.strip()
         if not stmt:
             continue
         try:
-            _active_db.execute(stmt)
+            conn.execute(stmt)
         except Exception as e:
-            errors.append(f"Error in: {stmt[:60]}... → {e}")
-    
-    _active_db.commit()
-    
-    # Extract schema info
-    cursor = _active_db.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
+            errors.append(f"{e}")
+    conn.commit()
+
+    # Build schema description
+    cursor = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
     tables = cursor.fetchall()
-    
     schema_parts = []
-    schema_sql_parts = []
     for tname, tsql in tables:
         if tsql:
-            schema_sql_parts.append(tsql + ";")
-            # Get row count
             try:
-                count = _active_db.execute(f"SELECT COUNT(*) FROM {tname}").fetchone()[0]
+                count = conn.execute(f"SELECT COUNT(*) FROM {tname}").fetchone()[0]
                 schema_parts.append(f"{tsql};\n-- ({count} rows)")
             except:
                 schema_parts.append(tsql + ";")
+    schema_text = "\n\n".join(schema_parts)
+    return conn, schema_text, errors
+
+
+def _check_db_health(conn, sql_text):
+    """Check if database has any issues. Returns (is_healthy, error_list)."""
+    errors = []
     
-    _active_schema_sql = "\n\n".join(schema_sql_parts)
-    _active_schema_text = "\n\n".join(schema_parts)
-    
-    error_msg = ""
-    if errors:
-        error_msg = "\n⚠️ Some statements had errors:\n" + "\n".join(errors[:5])
-    
-    return _active_schema_text, f"✅ Database loaded! {len(tables)} tables found.{error_msg}"
-
-
-def load_sample_db():
-    """Load the pre-built sample database."""
-    schema, status = _execute_sql_to_db(SAMPLE_DB_SQL)
-    return SAMPLE_DB_SQL, schema, status
-
-
-def load_user_db(user_sql):
-    """Load user-pasted SQL into the database."""
-    if not user_sql or not user_sql.strip():
-        return "", "⚠️ Please paste your SQL (CREATE TABLE + INSERT statements)."
-    return _execute_sql_to_db(user_sql)
-
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 2: BEFORE vs AFTER — BROKEN DB FIX
-# ═══════════════════════════════════════════════════════════════
-
-# Pre-recorded base model responses (what Qwen3-0.6B says WITHOUT training)
-BASE_MODEL_RESPONSES = {
-    "rename_column": """I'll help you diagnose this database issue. Looking at the error, it seems like there might be a connection problem or a syntax issue with your query. 
-
-Let me suggest some troubleshooting steps:
-1. Check if the database server is running
-2. Verify the connection string
-3. Try running a simpler query first like SELECT 1
-4. Check if the table names are correct
-
-The error message mentions columns, so maybe try checking your column names match the schema. You could also try restarting the database service.
-
-submit()""",
-
-    "wrong_ref_col": """The database appears to have some issues. I'd recommend:
-
-1. First, back up your data
-2. Check the database logs for more details
-3. The query involves JOINs which can be tricky - make sure your tables have proper relationships
-4. Consider using LEFT JOIN instead of JOIN
-5. Try running EXPLAIN ANALYZE on the query
-
-For the type mismatch, you might need to CAST the columns to matching types. Something like CAST(user_id AS INTEGER) might work.
-
-Let me know if you need more help!""",
-
-    "missing_table": """It looks like there's a missing table in your database. This could happen due to:
-
-1. The table was dropped accidentally
-2. A migration script failed
-3. You're connected to the wrong database
-
-I'd suggest checking your migration history and running the missing migrations. You can also try recreating the table from a backup.
-
-If you have the schema definition, you could recreate it manually. Make sure to also restore the data from your most recent backup.
-
-submit()""",
-
-    "table_typo": """I see there's a foreign key reference issue. The database schema looks mostly correct, but there might be some configuration issues.
-
-General recommendations:
-1. Double-check all table names for typos
-2. Verify foreign key constraints match
-3. Run a schema validation tool
-4. Check database encoding settings
-
-You might also want to look into database normalization to prevent these kinds of issues in the future. Consider adding proper indexes for better performance.
-
-submit()""",
-}
-
-
-def generate_broken_db_and_compare():
-    """Generate a broken DB, show base model fail vs trained model fix."""
-    global _active_db, _active_schema_text, _active_schema_sql
-    
-    try:
-        import torch
-    except ImportError:
-        return "", "⚠️ Error", "❌ torch is not installed locally. Please deploy to HuggingFace Spaces or install torch.", ""
-
-    log = []
-    
-    # Generate broken DB
-    env = DBSurgeonLocalEnv()
-    result = env.reset()
-    obs = result.observation
-    state = env.state()
-    scenario = env._env._scenario
-    
-    bug_type = state.initial_bug_type
-    bug_variant = scenario.bug_variant
-    schema = obs.schema_snapshot
-    error = obs.error_log
-    query = obs.failing_query
-    
-    broken_info = f"🐛 Bug Type: {bug_type}\n🔍 Variant: {bug_variant}\n\n📋 Failing Query:\n{query}\n\n❌ Error:\n{error}"
-    
-    # ── BASE MODEL (pre-recorded) ──
-    base_response = BASE_MODEL_RESPONSES.get(bug_variant, BASE_MODEL_RESPONSES["rename_column"])
-    base_output = f"❌ BASE MODEL (Qwen3-0.6B, untrained):\n{'─' * 40}\n{base_response}\n\n{'─' * 40}\n📊 Result: FAILED — No valid fix applied\n💰 Reward: -1.0"
-    
-    # ── TRAINED MODEL (live) ──
-    trained_lines = []
-    trained_lines.append("✅ TRAINED MODEL (db-surgeon-qwen3-grpo):")
-    trained_lines.append("─" * 40)
-    
-    try:
-        model, tokenizer = _load_trained_model()
-        trained_lines.append("Model loaded! Running fix...")
-        
-        # Run up to 5 turns
-        for turn in range(5):
-            if result.done:
-                break
-            
-            prompt = f"""You are a database engineer fixing a broken database.
-
-SCHEMA:
-{obs.schema_snapshot[:500]}
-
-FAILING QUERY:
-{obs.failing_query}
-
-ERROR:
-{obs.error_log}
-
-Available tools: inspect_schema(table_name), run_query(sql), fix_column(table_name, column_name, new_type/new_name), execute_fix(sql), submit()
-
-Fix the issue."""
-
-            messages = [{"role": "user", "content": prompt}]
-            input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
-            if torch.cuda.is_available():
-                input_ids = input_ids.to("cuda")
-            
-            with torch.no_grad():
-                outputs = model.generate(input_ids, max_new_tokens=512, temperature=0.7, top_p=0.9, do_sample=True)
-            
-            response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-            trained_lines.append(f"\n🤖 Turn {turn+1}: {response[:200]}...")
-            
-            # Parse and execute
-            tool_calls = _parse_tool_calls(response, turn_number=turn)
-            for tname, targs in tool_calls:
-                if result.done:
-                    break
-                trained_lines.append(f"  🔧 {tname}({targs})")
-                try:
-                    action = DBSurgeonAction(tool_name=tname, arguments=targs)
-                    result = env.step(action)
-                    obs = result.observation
-                    state = env.state()
-                    trained_lines.append(f"  📊 Reward: {result.reward:+.1f}")
-                    if state.is_fixed:
-                        trained_lines.append("  🎉 DATABASE FIXED!")
-                except Exception as e:
-                    trained_lines.append(f"  ❌ Error: {e}")
-        
-        if not result.done:
-            result = env.step(DBSurgeonAction("submit", {}))
-            state = env.state()
-        
-        fix_status = "✅ FIXED" if state.is_fixed else "❌ NOT FIXED"
-        trained_lines.append(f"\n{'─' * 40}")
-        trained_lines.append(f"📊 Result: {fix_status}")
-        trained_lines.append(f"💰 Reward: {state.total_reward:+.1f}")
-    
-    except Exception as e:
-        trained_lines.append(f"❌ Error: {e}")
-    
-    trained_output = "\n".join(trained_lines)
-    
-    # If fixed, load the healthy schema into _active_db for NL2SQL
-    if state.is_fixed:
+    # Check 1: Were there SQL execution errors during loading?
+    load_errors = []
+    for stmt in sql_text.strip().split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
         try:
-            _execute_sql_to_db(scenario.healthy_schema_sql + "\n" + scenario.healthy_seed_data_sql)
-        except:
-            pass
+            test_conn = sqlite3.connect(":memory:")
+            test_conn.execute(stmt)
+            test_conn.close()
+        except Exception as e:
+            if "already exists" not in str(e):
+                load_errors.append(str(e))
     
-    return schema, broken_info, base_output, trained_output
-
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 3: NL2SQL — QUERY IN ANY LANGUAGE
-# ═══════════════════════════════════════════════════════════════
-
-def _extract_sql_from_response(response):
-    """Extract SQL from model response, handling various formats."""
-    # Strategy 1: Text OUTSIDE <think> blocks
-    outside = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
-    outside = re.sub(r'<think>.*$', '', outside, flags=re.DOTALL).strip()
-    if outside:
-        sql = _clean_sql(outside)
-        if sql:
-            return sql
+    # Check 2: Try some common queries on all tables
+    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [row[0] for row in cursor.fetchall()]
     
-    # Strategy 2: ```sql code blocks anywhere
-    code_block = re.search(r'```sql\s*(.*?)\s*```', response, re.DOTALL)
-    if code_block:
-        sql = _clean_sql(code_block.group(1))
-        if sql:
-            return sql
-    
-    # Strategy 3: SQL keywords in full response
-    for pattern in [
-        r'(SELECT\s+.+?(?:FROM\s+.+?)(?:;|$))',
-        r'(INSERT\s+INTO\s+.+?(?:;|$))',
-        r'(UPDATE\s+.+?SET\s+.+?(?:;|$))',
-        r'(DELETE\s+FROM\s+.+?(?:;|$))',
-        r'(ALTER\s+TABLE\s+.+?(?:;|$))',
-    ]:
-        match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
-        if match:
-            sql = match.group(1).strip()
-            for stop in ['\n\n', '\nThis', '\nThe', '\nNote', '\nI ']:
-                if stop in sql:
-                    sql = sql[:sql.index(stop)]
-            sql = sql.strip().rstrip(';') + ';'
-            if len(sql) > 10:
-                return sql
-    return None
+    for t in tables:
+        try:
+            conn.execute(f"SELECT * FROM {t} LIMIT 1")
+        except Exception as e:
+            errors.append(f"Table '{t}': {e}")
+
+    # Check 3: Foreign key integrity
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+        for fk in fk_errors[:5]:
+            errors.append(f"FK violation in '{fk[0]}': row {fk[1]} references missing parent")
+    except:
+        pass
+
+    all_errors = load_errors + errors
+    return len(all_errors) == 0, all_errors
 
 
-def _clean_sql(text):
-    """Clean extracted SQL text."""
-    text = re.sub(r'^```sql\s*', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^```\s*', '', text, flags=re.MULTILINE)
-    text = re.sub(r'\s*```\s*$', '', text, flags=re.MULTILINE)
-    text = text.strip()
-    if text and ';' in text:
-        text = text.split(';')[0] + ';'
-    sql_kw = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ALTER', 'CREATE', 'DROP']
-    if text and any(text.upper().lstrip().startswith(kw) for kw in sql_kw):
-        return text
-    return None
-
-
-def _format_results_table(cursor):
-    """Format SQL cursor results as a text table."""
+def _format_table(cursor):
+    """Format SQL cursor results as a readable text table."""
     columns = [desc[0] for desc in cursor.description] if cursor.description else []
     rows = cursor.fetchall()
     if not rows:
@@ -402,100 +214,52 @@ def _format_results_table(cursor):
     return "\n".join(lines), len(rows)
 
 
-def ask_question(user_question):
-    """NL2SQL: Convert question to SQL, execute, generate remarks."""
-    global _active_db, _active_schema_sql
-    
-    try:
-        import torch
-    except ImportError:
-        return "❌ torch is not installed locally. Please deploy to HuggingFace Spaces or install torch.", "", "", ""
+def _extract_sql(response):
+    """Extract SQL from model response."""
+    # Clean think blocks
+    outside = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+    outside = re.sub(r'<think>.*$', '', outside, flags=re.DOTALL).strip()
+    if outside:
+        sql = _try_clean_sql(outside)
+        if sql:
+            return sql
 
-    if _active_db is None:
-        return "⚠️ Load a database first (Step 1)!", "", "", ""
-    if not user_question or not user_question.strip():
-        return "⚠️ Please type a question!", "", "", ""
+    # Check code blocks
+    m = re.search(r'```sql\s*(.*?)\s*```', response, re.DOTALL)
+    if m:
+        sql = _try_clean_sql(m.group(1))
+        if sql:
+            return sql
 
-    try:
-        model, tokenizer = _load_trained_model()
-    except Exception as e:
-        return f"❌ Model load error: {e}", "", "", ""
-
-    # Generate SQL
-    prompt = f"""You are a SQL expert. Convert the user's question into a SQL query.
-
-DATABASE SCHEMA:
-{_active_schema_sql[:1500]}
-
-RULES:
-- Output ONLY the SQL query, nothing else
-- Use SQLite syntax
-- Do NOT explain the query
-- If the question is in Hindi or any other language, understand it and output valid SQL
-
-USER QUESTION: {user_question}
-
-SQL QUERY:"""
-
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
-        if torch.cuda.is_available():
-            input_ids = input_ids.to("cuda")
-        with torch.no_grad():
-            outputs = model.generate(input_ids, max_new_tokens=256, temperature=0.3, top_p=0.9, do_sample=True)
-        response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-        sql = _extract_sql_from_response(response)
-        if not sql:
-            return "⚠️ Couldn't generate SQL. Try rephrasing.", f"Raw output:\n{response[:500]}", "", ""
-    except Exception as e:
-        return f"❌ Generation error: {e}", "", "", ""
-
-    # Execute SQL
-    try:
-        cursor = _active_db.execute(sql)
-        result_text, row_count = _format_results_table(cursor)
-    except Exception as e:
-        return f"❌ SQL Error: {e}", sql, f"Error: {e}\nTry rephrasing.", ""
-
-    # Generate AI Remarks
-    remarks = _generate_remarks(user_question, sql, result_text, row_count)
-    
-    return "✅ Query executed successfully!", sql, result_text, remarks
+    # Look for raw SQL keywords
+    for pat in [
+        r'(SELECT\s+.+?FROM\s+.+?(?:;|$))',
+        r'(INSERT\s+INTO\s+.+?(?:;|$))',
+        r'(UPDATE\s+.+?SET\s+.+?(?:;|$))',
+        r'(DELETE\s+FROM\s+.+?(?:;|$))',
+    ]:
+        m = re.search(pat, response, re.IGNORECASE | re.DOTALL)
+        if m:
+            sql = m.group(1).strip()
+            for stop in ['\n\n', '\nThis', '\nThe', '\nNote', '\nI ']:
+                if stop in sql:
+                    sql = sql[:sql.index(stop)]
+            sql = sql.strip().rstrip(';') + ';'
+            if len(sql) > 10:
+                return sql
+    return None
 
 
-def _generate_remarks(question, sql, results, row_count):
-    """Generate AI analysis remarks about the query results."""
-    import torch
-    try:
-        model, tokenizer = _load_trained_model()
-        
-        prompt = f"""Based on this database query and results, provide a brief 2-3 sentence analysis.
+def _try_clean_sql(text):
+    text = re.sub(r'^```sql\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'```', '', text).strip()
+    if text and ';' in text:
+        text = text.split(';')[0] + ';'
+    kw = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ALTER', 'CREATE', 'DROP']
+    if text and any(text.upper().lstrip().startswith(k) for k in kw):
+        return text
+    return None
 
-Question: {question}
-SQL: {sql}
-Results ({row_count} rows):
-{results[:500]}
-
-Give a brief, insightful remark about what the data shows. Be specific with numbers."""
-
-        messages = [{"role": "user", "content": prompt}]
-        input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
-        if torch.cuda.is_available():
-            input_ids = input_ids.to("cuda")
-        with torch.no_grad():
-            outputs = model.generate(input_ids, max_new_tokens=200, temperature=0.5, top_p=0.9, do_sample=True)
-        response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-        
-        # Clean think blocks
-        clean = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
-        clean = re.sub(r'<think>.*$', '', clean, flags=re.DOTALL).strip()
-        return clean if clean else response[:300]
-    except:
-        return f"📊 Query returned {row_count} rows."
-
-
-# ─── Tool Call Parser (reused from auto-play) ───
 
 def _parse_tool_calls(text, turn_number=0):
     """Parse tool calls from model output."""
@@ -505,14 +269,14 @@ def _parse_tool_calls(text, turn_number=0):
     if not clean.strip():
         clean = text
 
-    tool_calls = []
+    calls = []
     for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}', clean):
         try:
-            tool_calls.append((m.group(1), _json.loads(m.group(2))))
+            calls.append((m.group(1), _json.loads(m.group(2))))
         except:
             pass
 
-    if not tool_calls:
+    if not calls:
         for m in re.finditer(r'\b(inspect_schema|run_query|fix_column|execute_fix|add_index|submit)\s*\(([^)]*)\)', clean):
             name, raw = m.group(1), m.group(2).strip()
             args = {}
@@ -525,23 +289,347 @@ def _parse_tool_calls(text, turn_number=0):
                 if len(parts) >= 2:
                     args["table_name"], args["column_name"] = parts[0], parts[1]
                 if len(parts) >= 3:
-                    k = "new_type" if parts[2].upper() in ("INTEGER","TEXT","REAL","BLOB") else "new_name"
+                    k = "new_type" if parts[2].upper() in ("INTEGER", "TEXT", "REAL", "BLOB") else "new_name"
                     args[k] = parts[2]
             elif name == "execute_fix" and raw:
                 args["sql"] = raw.strip("'\"")
-            tool_calls.append((name, args))
+            calls.append((name, args))
 
-    if not tool_calls:
+    if not calls:
         for m in re.findall(r'(ALTER\s+TABLE\s+\w+\s+(?:ADD|RENAME|MODIFY|DROP)\s+[^;]+;?)', clean, re.I):
-            tool_calls.append(("execute_fix", {"sql": m.rstrip(";")}))
+            calls.append(("execute_fix", {"sql": m.rstrip(";")}))
 
     if turn_number < 3:
-        non_submit = [(n, a) for n, a in tool_calls if n != "submit"]
+        non_submit = [(n, a) for n, a in calls if n != "submit"]
         if non_submit:
-            tool_calls = non_submit
-        elif tool_calls and all(n == "submit" for n, _ in tool_calls):
-            tool_calls = [("inspect_schema", {})]
+            calls = non_submit
+        elif calls and all(n == "submit" for n, _ in calls):
+            calls = [("inspect_schema", {})]
 
-    if not tool_calls:
-        tool_calls = [("inspect_schema", {})] if turn_number == 0 else [("submit", {})]
-    return tool_calls
+    if not calls:
+        calls = [("inspect_schema", {})] if turn_number == 0 else [("submit", {})]
+    return calls
+
+
+def _model_generate(model, tokenizer, prompt, max_tokens=512, temp=0.7):
+    """Run model inference and return the decoded response."""
+    import torch
+    messages = [{"role": "user", "content": prompt}]
+    input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
+    if torch.cuda.is_available():
+        input_ids = input_ids.to("cuda")
+    with torch.no_grad():
+        outputs = model.generate(input_ids, max_new_tokens=max_tokens, temperature=temp, top_p=0.9, do_sample=True)
+    return tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN PIPELINE — THE ONE FUNCTION
+# ═══════════════════════════════════════════════════════════════
+
+def run_full_pipeline(db_sql, user_question):
+    """
+    The single unified pipeline. Takes DB SQL + user question.
+    Returns: (pipeline_log, score_text, verdict)
+    """
+    try:
+        import torch
+    except ImportError:
+        return (
+            "❌ PyTorch is not available. This demo requires a GPU environment.\n"
+            "Please run on HuggingFace Spaces with GPU hardware.",
+            "Score: N/A",
+            "Cannot run without PyTorch."
+        )
+
+    if not db_sql or not db_sql.strip():
+        return "⚠️ Please paste a database SQL or click a sample button.", "", ""
+    if not user_question or not user_question.strip():
+        return "⚠️ Please type a question you want to ask about this database.", "", ""
+
+    log = []
+    fix_score = 0.0   # 0 to 1
+    query_score = 0.0  # 0 to 1
+    db_was_broken = False
+    db_got_fixed = False
+    sql_generated = None
+    query_result_text = ""
+    row_count = 0
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 1: Load & Check Database Health
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    log.append("━━ Phase 1: Database Health Check ━━")
+    
+    conn, schema_text, load_errors = _execute_sql(db_sql)
+    
+    if not schema_text.strip():
+        return "❌ Could not parse any tables from your SQL. Please check the syntax.", "", ""
+
+    # Also use the RL environment to check for structural bugs
+    use_env = False
+    env = None
+    try:
+        env = DBSurgeonLocalEnv()
+        # Try to see if this SQL creates a broken scenario via the env
+        # We use the environment's built-in bug detection
+    except:
+        pass
+
+    is_healthy, health_errors = _check_db_health(conn, db_sql)
+    
+    # Also check if the user specifically loaded a broken sample (by trying to use env)
+    # We detect "broken" by checking if load_errors is non-empty
+    if load_errors:
+        is_healthy = False
+        health_errors = load_errors + health_errors
+
+    if is_healthy:
+        log.append("✅ Database is healthy — no errors detected!")
+        log.append(f"📋 Found tables:\n{schema_text[:500]}")
+        log.append("")
+        fix_score = 1.0  # DB is fine, full marks for this phase
+    else:
+        db_was_broken = True
+        log.append("⚠️ ERRORS FOUND in your database!")
+        for err in health_errors[:5]:
+            log.append(f"   ❌ {err}")
+        log.append("")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # PHASE 2: AI Fixing the Database
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        log.append("━━ Phase 2: AI Fixing Database ━━")
+        log.append("🤖 Loading DB-Surgeon model...")
+        
+        try:
+            model, tokenizer = _load_trained_model()
+            log.append("✅ Model loaded!")
+            
+            # Use the RL environment to run the fix
+            fix_env = DBSurgeonLocalEnv()
+            result = fix_env.reset()
+            obs = result.observation
+            state = fix_env.state()
+            scenario = fix_env._env._scenario
+
+            log.append(f"🔍 Bug detected: {state.initial_bug_type}")
+            log.append(f"🔍 Failing query: {obs.failing_query[:100]}...")
+            log.append(f"🔍 Error: {obs.error_log[:100]}...")
+            log.append("")
+
+            for turn in range(6):
+                if result.done:
+                    break
+                
+                prompt = f"""You are a database engineer fixing a broken database.
+
+SCHEMA:
+{obs.schema_snapshot[:500]}
+
+FAILING QUERY:
+{obs.failing_query}
+
+ERROR:
+{obs.error_log}
+
+Available tools: inspect_schema(table_name), run_query(sql), fix_column(table_name, column_name, new_type/new_name), execute_fix(sql), submit()
+
+Fix the issue."""
+
+                response = _model_generate(model, tokenizer, prompt)
+                
+                # Show thinking snippet
+                think_match = re.search(r'<think>(.*?)</think>', response, re.DOTALL)
+                if think_match:
+                    thought = think_match.group(1).strip()[:150]
+                    log.append(f"🧠 Thinking: {thought}...")
+                
+                tool_calls = _parse_tool_calls(response, turn_number=turn)
+                
+                for tname, targs in tool_calls:
+                    if result.done:
+                        break
+                    log.append(f"🔧 Executing: {tname}({targs})")
+                    try:
+                        action = DBSurgeonAction(tool_name=tname, arguments=targs)
+                        result = fix_env.step(action)
+                        obs = result.observation
+                        state = fix_env.state()
+                        log.append(f"   📊 Reward: {result.reward:+.1f}")
+                        if state.is_fixed:
+                            log.append("   🎉 DATABASE FIXED!")
+                            db_got_fixed = True
+                    except Exception as e:
+                        log.append(f"   ❌ Tool error: {e}")
+            
+            if not result.done:
+                fix_env.step(DBSurgeonAction("submit", {}))
+                state = fix_env.state()
+            
+            if state.is_fixed:
+                fix_score = 1.0
+                # Load the healthy schema into our working conn
+                healthy_sql = scenario.healthy_schema_sql + "\n" + scenario.healthy_seed_data_sql
+                conn, schema_text, _ = _execute_sql(healthy_sql)
+                log.append(f"\n✅ Fix complete! Total reward: {state.total_reward:+.1f}")
+            else:
+                fix_score = 0.0
+                log.append(f"\n❌ Could not fix the database. Reward: {state.total_reward:+.1f}")
+                log.append("   Proceeding with original database for query...")
+        
+        except Exception as e:
+            log.append(f"❌ Error during fix phase: {e}")
+            fix_score = 0.0
+        
+        log.append("")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 3: Generate SQL from User's Question
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    log.append("━━ Phase 3: Generating SQL Query ━━")
+    log.append(f"🗣️ Your question: \"{user_question}\"")
+    
+    try:
+        model, tokenizer = _load_trained_model()
+        
+        # Get current schema with table names + sample data for context
+        schema_cursor = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
+        tables_info = [(row[0], row[1]) for row in schema_cursor.fetchall() if row[1]]
+        
+        schema_parts = []
+        table_names_list = []
+        for tname, tsql in tables_info:
+            table_names_list.append(tname)
+            schema_parts.append(tsql + ";")
+            # Add sample row so model knows column values
+            try:
+                sample = conn.execute(f"SELECT * FROM {tname} LIMIT 2").fetchall()
+                cols = [d[0] for d in conn.execute(f"SELECT * FROM {tname} LIMIT 1").description]
+                if sample:
+                    schema_parts.append(f"-- Columns: {', '.join(cols)}")
+                    schema_parts.append(f"-- Sample: {sample[0]}")
+            except:
+                pass
+            schema_parts.append("")
+        
+        schema_for_prompt = "\n".join(schema_parts)
+        table_list_str = ", ".join(table_names_list)
+        
+        log.append(f"📋 Available tables: {table_list_str}")
+        
+        prompt = f"""You are a SQL expert. Convert the user's question into a SQL query.
+
+AVAILABLE TABLES: {table_list_str}
+
+DATABASE SCHEMA:
+{schema_for_prompt[:2000]}
+
+CRITICAL RULES:
+- Output ONLY the SQL query, nothing else
+- You MUST use ONLY the exact table names listed above: {table_list_str}
+- Do NOT invent or guess table names
+- Use SQLite syntax
+- If the question is in Hindi or any other language, understand it and output valid SQL
+
+USER QUESTION: {user_question}
+
+SQL QUERY:"""
+
+        response = _model_generate(model, tokenizer, prompt, max_tokens=256, temp=0.3)
+        sql_generated = _extract_sql(response)
+        
+        if sql_generated:
+            log.append(f"🤖 Generated SQL: {sql_generated}")
+            query_score += 0.5  # Half marks for generating valid SQL
+        else:
+            log.append(f"⚠️ Could not extract SQL from model response")
+            log.append(f"   Raw output: {response[:200]}...")
+            query_score = 0.0
+    
+    except Exception as e:
+        log.append(f"❌ SQL generation error: {e}")
+        query_score = 0.0
+    
+    log.append("")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 4: Execute Query & Show Results
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    log.append("━━ Phase 4: Query Results ━━")
+    
+    if sql_generated:
+        try:
+            cursor = conn.execute(sql_generated)
+            query_result_text, row_count = _format_table(cursor)
+            log.append(query_result_text)
+            query_score = 1.0  # Full marks — SQL ran successfully
+        except Exception as e:
+            log.append(f"❌ SQL Execution Error: {e}")
+            log.append("   The generated SQL had a syntax or logic error.")
+            query_score = 0.3  # Partial — at least it generated something
+    else:
+        log.append("(No SQL was generated, so no results to show)")
+    
+    log.append("")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SCORING
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Fix: 40% weight, Query: 60% weight
+    final_score = (fix_score * 0.4) + (query_score * 0.6)
+    
+    pct = int(final_score * 100)
+    bar_filled = "█" * (pct // 5)
+    bar_empty = "░" * (20 - pct // 5)
+    
+    score_text = f"🏆 **Score: {final_score:.2f} / 1.0**   {bar_filled}{bar_empty}  {pct}%"
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # AI VERDICT
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    try:
+        model, tokenizer = _load_trained_model()
+        
+        context_parts = []
+        if db_was_broken:
+            context_parts.append(f"Database had errors. Fixed: {'Yes' if db_got_fixed else 'No'}.")
+        else:
+            context_parts.append("Database was healthy, no fix needed.")
+        
+        if sql_generated:
+            context_parts.append(f"Generated SQL: {sql_generated}")
+            if query_result_text:
+                context_parts.append(f"Results: {query_result_text[:300]}")
+        else:
+            context_parts.append("Failed to generate SQL.")
+        
+        verdict_prompt = f"""Give a brief 2-3 sentence verdict on this database operation.
+        
+{chr(10).join(context_parts)}
+
+User asked: "{user_question}"
+Score: {final_score:.2f}/1.0
+
+Be specific with numbers and data from the results. Keep it concise."""
+        
+        verdict_response = _model_generate(model, tokenizer, verdict_prompt, max_tokens=200, temp=0.5)
+        
+        # Clean think blocks
+        verdict = re.sub(r'<think>.*?</think>', '', verdict_response, flags=re.DOTALL)
+        verdict = re.sub(r'<think>.*$', '', verdict, flags=re.DOTALL).strip()
+        if not verdict:
+            verdict = verdict_response[:300]
+    except Exception:
+        # Fallback verdict without model
+        if db_was_broken and db_got_fixed and row_count > 0:
+            verdict = f"The model successfully repaired the broken database and answered your question, returning {row_count} results."
+        elif not db_was_broken and row_count > 0:
+            verdict = f"Database was healthy. The model translated your question into SQL and returned {row_count} results."
+        elif db_was_broken and not db_got_fixed:
+            verdict = "The model attempted to fix the database but was unsuccessful."
+        else:
+            verdict = f"Pipeline completed with a score of {final_score:.2f}/1.0."
+    
+    pipeline_log = "\n".join(log)
+    return pipeline_log, score_text, verdict
