@@ -198,14 +198,28 @@ def _load_trained_model():
     return _trained_model, _trained_tokenizer
 
 
-def _parse_tool_calls(text):
-    """Parse tool calls from model output text."""
+def _parse_tool_calls(text, turn_number=0):
+    """Parse tool calls from model output text.
+    
+    Args:
+        text: Raw model output text
+        turn_number: Current turn (0-indexed). Used to prevent premature submit.
+    """
     import json as _json
+
+    # Strip <think>...</think> blocks — model reasons here, not actual tool calls
+    clean_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    # Also strip partial thinking blocks (model didn't close the tag)
+    clean_text = re.sub(r'<think>.*$', '', clean_text, flags=re.DOTALL)
+
+    if not clean_text.strip():
+        # All content was inside <think>, use full text as fallback
+        clean_text = text
 
     tool_calls = []
 
     # Try JSON tool_call format: {"name": "...", "arguments": {...}}
-    for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}', text):
+    for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}', clean_text):
         try:
             name = m.group(1)
             args = _json.loads(m.group(2))
@@ -215,7 +229,7 @@ def _parse_tool_calls(text):
 
     # Try function call format: tool_name(arg1, arg2)
     if not tool_calls:
-        for m in re.finditer(r'\b(inspect_schema|run_query|fix_column|execute_fix|add_index|add_constraint|submit)\s*\(([^)]*)\)', text):
+        for m in re.finditer(r'\b(inspect_schema|run_query|fix_column|execute_fix|add_index|add_constraint|submit)\s*\(([^)]*)\)', clean_text):
             name = m.group(1)
             raw_args = m.group(2).strip()
             args = {}
@@ -247,14 +261,27 @@ def _parse_tool_calls(text):
     if not tool_calls:
         sql_matches = re.findall(
             r'(ALTER\s+TABLE\s+\w+\s+(?:ADD|RENAME|MODIFY|DROP)\s+[^;]+;?)',
-            text, re.IGNORECASE
+            clean_text, re.IGNORECASE
         )
         for sql in sql_matches[:3]:
             tool_calls.append(("execute_fix", {"sql": sql.rstrip(";")}))
 
-    # Always end with submit if nothing else found
+    # Prevent premature submit: on early turns, don't submit unless there are
+    # other tool calls before it
+    if turn_number < 3:
+        non_submit = [(n, a) for n, a in tool_calls if n != "submit"]
+        if non_submit:
+            tool_calls = non_submit  # Drop submit, keep other tools
+        elif tool_calls and all(n == "submit" for n, _ in tool_calls):
+            # Only submit found on early turn — replace with inspect_schema
+            tool_calls = [("inspect_schema", {})]
+
+    # Default: inspect if nothing found
     if not tool_calls:
-        tool_calls.append(("submit", {}))
+        if turn_number == 0:
+            tool_calls = [("inspect_schema", {})]
+        else:
+            tool_calls = [("submit", {})]
 
     return tool_calls
 
@@ -344,7 +371,7 @@ Diagnose the issue and fix it. Call the appropriate tool."""
             break
 
         # Parse and execute tool calls
-        tool_calls = _parse_tool_calls(response)
+        tool_calls = _parse_tool_calls(response, turn_number=turn)
         if not tool_calls:
             log_lines.append("⚠️ No tool calls found, trying inspect_schema...")
             tool_calls = [("inspect_schema", {})]
