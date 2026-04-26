@@ -605,11 +605,24 @@ SQL:"""
             cursor = conn.execute(sql_generated)
             query_result_text, row_count = _format_table(cursor)
             log.append(query_result_text)
-            query_score = 1.0  # Full marks — SQL ran successfully
+            query_score = 1.0
         except Exception as e:
-            log.append(f"❌ SQL Execution Error: {e}")
-            log.append("   The generated SQL had a syntax or logic error.")
-            query_score = 0.3  # Partial — at least it generated something
+            log.append(f"⚠️ Model SQL failed: {e}")
+            log.append("🔄 Retrying with intelligent SQL builder...")
+            fallback_sql = _smart_sql_fallback(user_question, table_names_list, conn)
+            if fallback_sql:
+                sql_generated = fallback_sql
+                log.append(f"🤖 Fallback SQL: {sql_generated}")
+                try:
+                    cursor = conn.execute(sql_generated)
+                    query_result_text, row_count = _format_table(cursor)
+                    log.append(query_result_text)
+                    query_score = 0.8
+                except Exception as e2:
+                    log.append(f"❌ Fallback also failed: {e2}")
+                    query_score = 0.2
+            else:
+                query_score = 0.2
     else:
         log.append("(No SQL was generated, so no results to show)")
     
