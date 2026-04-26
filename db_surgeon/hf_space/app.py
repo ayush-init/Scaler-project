@@ -10,6 +10,7 @@ It provides:
 
 import os
 import sys
+import re
 import json
 import time
 import random
@@ -163,6 +164,284 @@ def demo_action(tool_name, arg1, arg2, arg3):
 
     return status, schema, error, query, history, f"{state.total_reward:+.1f}"
 
+
+# ─── Trained Model Auto-Play ───
+
+_trained_model = None
+_trained_tokenizer = None
+
+def _load_trained_model():
+    """Load the trained model from HuggingFace Hub (cached)."""
+    global _trained_model, _trained_tokenizer
+    if _trained_model is not None:
+        return _trained_model, _trained_tokenizer
+
+    import torch
+    try:
+        from unsloth import FastLanguageModel
+        _trained_model, _trained_tokenizer = FastLanguageModel.from_pretrained(
+            model_name="ayush0211/db-surgeon-qwen3-0.6b-grpo",
+            max_seq_length=2048,
+            load_in_4bit=True,
+            dtype=torch.float16,
+        )
+        FastLanguageModel.for_inference(_trained_model)
+    except Exception:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        _trained_tokenizer = AutoTokenizer.from_pretrained("ayush0211/db-surgeon-qwen3-0.6b-grpo")
+        _trained_model = AutoModelForCausalLM.from_pretrained(
+            "ayush0211/db-surgeon-qwen3-0.6b-grpo",
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+
+    return _trained_model, _trained_tokenizer
+
+
+def _parse_tool_calls(text):
+    """Parse tool calls from model output text."""
+    import json as _json
+
+    tool_calls = []
+
+    # Try JSON tool_call format: {"name": "...", "arguments": {...}}
+    for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}', text):
+        try:
+            name = m.group(1)
+            args = _json.loads(m.group(2))
+            tool_calls.append((name, args))
+        except Exception:
+            pass
+
+    # Try function call format: tool_name(arg1, arg2)
+    if not tool_calls:
+        for m in re.finditer(r'\b(inspect_schema|run_query|fix_column|execute_fix|add_index|add_constraint|submit)\s*\(([^)]*)\)', text):
+            name = m.group(1)
+            raw_args = m.group(2).strip()
+            args = {}
+            if name == "inspect_schema" and raw_args:
+                args["table_name"] = raw_args.strip("'\"")
+            elif name == "run_query" and raw_args:
+                args["sql"] = raw_args.strip("'\"")
+            elif name == "fix_column":
+                parts = [p.strip().strip("'\"") for p in raw_args.split(",")]
+                if len(parts) >= 2:
+                    args["table_name"] = parts[0]
+                    args["column_name"] = parts[1]
+                if len(parts) >= 3:
+                    val = parts[2]
+                    if val.upper() in ("INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC"):
+                        args["new_type"] = val
+                    else:
+                        args["new_name"] = val
+            elif name == "execute_fix" and raw_args:
+                args["sql"] = raw_args.strip("'\"")
+            elif name == "add_index":
+                parts = [p.strip().strip("'\"") for p in raw_args.split(",")]
+                if len(parts) >= 2:
+                    args["table_name"] = parts[0]
+                    args["column_name"] = parts[1]
+            tool_calls.append((name, args))
+
+    # Try to find SQL statements and wrap as execute_fix
+    if not tool_calls:
+        sql_matches = re.findall(
+            r'(ALTER\s+TABLE\s+\w+\s+(?:ADD|RENAME|MODIFY|DROP)\s+[^;]+;?)',
+            text, re.IGNORECASE
+        )
+        for sql in sql_matches[:3]:
+            tool_calls.append(("execute_fix", {"sql": sql.rstrip(";")}))
+
+    # Always end with submit if nothing else found
+    if not tool_calls:
+        tool_calls.append(("submit", {}))
+
+    return tool_calls
+
+
+def auto_play_model():
+    """Auto-play: load trained model and solve the current episode."""
+    global demo_env, demo_obs
+    import torch
+
+    log_lines = []
+
+    # Step 1: Reset environment
+    log_lines.append("=" * 60)
+    log_lines.append("🤖 TRAINED MODEL AUTO-PLAY")
+    log_lines.append("=" * 60)
+
+    demo_env = DBSurgeonLocalEnv()
+    result = demo_env.reset()
+    demo_obs = result.observation
+    state = demo_env.state()
+
+    log_lines.append(f"\n📋 Bug Type: {state.initial_bug_type}")
+    log_lines.append(f"📋 Failing Query: {demo_obs.failing_query[:100]}...")
+    log_lines.append(f"📋 Error: {demo_obs.error_log[:100]}...")
+
+    # Step 2: Load model
+    log_lines.append("\n⏳ Loading trained model...")
+    yield _format_autoplay_output(log_lines, state, demo_obs)
+
+    try:
+        model, tokenizer = _load_trained_model()
+        log_lines.append("✅ Model loaded!")
+    except Exception as e:
+        log_lines.append(f"❌ Model load failed: {e}")
+        log_lines.append("\n🔧 Falling back to scripted agent...")
+        # Fallback: run scripted agent
+        yield from _run_fallback_scripted(log_lines, state)
+        return
+
+    # Step 3: Generate & execute actions
+    max_turns = 8
+    for turn in range(max_turns):
+        if result.done:
+            break
+
+        log_lines.append(f"\n{'─' * 40}")
+        log_lines.append(f"🔄 Turn {turn + 1}/{max_turns}")
+
+        # Build prompt from current observation
+        prompt = f"""You are a database engineer fixing a broken database.
+
+CURRENT SCHEMA:
+{demo_obs.schema_snapshot[:500]}
+
+FAILING QUERY:
+{demo_obs.failing_query}
+
+ERROR:
+{demo_obs.error_log}
+
+Available tools: inspect_schema(table_name), run_query(sql), fix_column(table_name, column_name, new_type/new_name), execute_fix(sql), add_index(table_name, column_name), submit()
+
+Diagnose the issue and fix it. Call the appropriate tool."""
+
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            input_ids = tokenizer.apply_chat_template(
+                messages, return_tensors="pt", add_generation_prompt=True
+            )
+            if torch.cuda.is_available():
+                input_ids = input_ids.to("cuda")
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids,
+                    max_new_tokens=512,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True,
+                )
+
+            response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+            log_lines.append(f"🧠 Model output:\n{response[:300]}{'...' if len(response) > 300 else ''}")
+
+        except Exception as e:
+            log_lines.append(f"❌ Generation error: {e}")
+            break
+
+        # Parse and execute tool calls
+        tool_calls = _parse_tool_calls(response)
+        if not tool_calls:
+            log_lines.append("⚠️ No tool calls found, trying inspect_schema...")
+            tool_calls = [("inspect_schema", {})]
+
+        for tool_name, args in tool_calls:
+            if result.done:
+                break
+            log_lines.append(f"\n  🔧 Executing: {tool_name}({args})")
+            try:
+                action = DBSurgeonAction(tool_name=tool_name, arguments=args)
+                result = demo_env.step(action)
+                demo_obs = result.observation
+                state = demo_env.state()
+                log_lines.append(f"  📊 Reward: {result.reward:+.1f} | Total: {state.total_reward:+.1f}")
+                if result.done:
+                    if state.is_fixed:
+                        log_lines.append("  🎉 DATABASE FIXED!")
+                    else:
+                        log_lines.append("  ❌ Episode ended (not fixed)")
+            except Exception as e:
+                log_lines.append(f"  ❌ Action error: {e}")
+
+        yield _format_autoplay_output(log_lines, state, demo_obs)
+
+    # Final status
+    if not result.done:
+        # Force submit
+        log_lines.append(f"\n{'─' * 40}")
+        log_lines.append("⏰ Max turns reached, submitting...")
+        result = demo_env.step(DBSurgeonAction("submit", {}))
+        demo_obs = result.observation
+        state = demo_env.state()
+
+    log_lines.append(f"\n{'=' * 60}")
+    log_lines.append(f"📊 FINAL RESULT")
+    log_lines.append(f"  Total Reward: {state.total_reward:+.1f}")
+    log_lines.append(f"  Fixed: {'✅ YES' if state.is_fixed else '❌ NO'}")
+    log_lines.append(f"  Steps Used: {state.step_count}/{demo_obs.max_steps}")
+    log_lines.append(f"{'=' * 60}")
+
+    yield _format_autoplay_output(log_lines, state, demo_obs)
+
+
+def _run_fallback_scripted(log_lines, state):
+    """Fallback scripted agent when model can't load (e.g., CPU mode)."""
+    global demo_env, demo_obs
+
+    scenario = demo_env._env._scenario
+    tables = demo_env._env._db.get_table_names()
+    root = demo_env.state().root_cause.lower()
+
+    log_lines.append("  Inspecting schema...")
+    r = demo_env.step(DBSurgeonAction("inspect_schema", {}))
+    demo_obs = r.observation
+
+    log_lines.append(f"  Root cause: {root[:80]}")
+
+    if "renamed" in root or "usr_id" in root:
+        orders = [t for t in tables if "orders" in t]
+        if orders:
+            log_lines.append(f"  Fixing renamed column in {orders[0]}...")
+            demo_env.step(DBSurgeonAction("fix_column", {"table_name": orders[0], "column_name": "usr_id", "new_name": "user_id"}))
+    elif "text" in root or "type" in root:
+        orders = [t for t in tables if "orders" in t]
+        if orders:
+            log_lines.append(f"  Fixing column type in {orders[0]}...")
+            demo_env.step(DBSurgeonAction("fix_column", {"table_name": orders[0], "column_name": "user_id", "new_type": "INTEGER"}))
+    else:
+        log_lines.append("  Applying schema fix...")
+        demo_env.step(DBSurgeonAction("execute_fix", {"sql": scenario.healthy_schema_sql}))
+
+    log_lines.append("  Submitting fix...")
+    r = demo_env.step(DBSurgeonAction("submit", {}))
+    demo_obs = r.observation
+    state = demo_env.state()
+
+    log_lines.append(f"\n{'=' * 60}")
+    log_lines.append(f"📊 RESULT (Scripted Agent)")
+    log_lines.append(f"  Total Reward: {state.total_reward:+.1f}")
+    log_lines.append(f"  Fixed: {'✅ YES' if state.is_fixed else '❌ NO'}")
+    log_lines.append(f"{'=' * 60}")
+
+    yield _format_autoplay_output(log_lines, state, demo_obs)
+
+
+def _format_autoplay_output(log_lines, state, obs):
+    """Format outputs for the autoplay UI update."""
+    done_str = " | **DONE**" if state.is_done else ""
+    fixed_str = " ✅ FIXED!" if state.is_fixed else ""
+    status = f"🤖 Auto-Play | Step {state.step_count}/{obs.max_steps} | Total: {state.total_reward:+.1f}{done_str}{fixed_str}"
+    schema = obs.schema_snapshot
+    error = obs.error_log
+    query = obs.failing_query
+    history = "\n".join(log_lines[-30:])
+    reward = f"{state.total_reward:+.1f}"
+    return status, schema, error, query, history, reward
 
 # ═══════════════════════════════════════════════════════════════
 # TAB 2: TRAINING
@@ -580,7 +859,12 @@ with gr.Blocks(
                 tool_arg3 = gr.Textbox(label="Arg 3 (new_type / new_name)", placeholder="INTEGER, TEXT, or new name", scale=1)
 
             action_btn = gr.Button("▶️ Execute Tool", variant="secondary")
-            demo_history = gr.Textbox(label="Action History", lines=6, interactive=False)
+            demo_history = gr.Textbox(label="Action History", lines=12, interactive=False)
+
+            gr.Markdown("---")
+            gr.Markdown("### 🤖 Or let the Trained Model solve it automatically")
+            gr.Markdown("Loads `ayush0211/db-surgeon-qwen3-0.6b-grpo` and watches it diagnose & fix the database in real-time.")
+            autoplay_btn = gr.Button("🤖 Auto-Play with Trained Model", variant="primary", size="lg")
 
             reset_btn.click(
                 demo_reset,
@@ -589,6 +873,10 @@ with gr.Blocks(
             action_btn.click(
                 demo_action,
                 inputs=[tool_select, tool_arg1, tool_arg2, tool_arg3],
+                outputs=[demo_status, demo_schema, demo_error, demo_query, demo_history, demo_reward],
+            )
+            autoplay_btn.click(
+                auto_play_model,
                 outputs=[demo_status, demo_schema, demo_error, demo_query, demo_history, demo_reward],
             )
 
